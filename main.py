@@ -1,48 +1,67 @@
+import os
 import time
 import sys
-from arduino import rpc # Imports the native Uno Q communication library
+
+BOARD_IP = "192.168.0.102"
+os.environ["ARDUINO_BOARD_IP"] = BOARD_IP
+
+from arduino.app_utils import App, Bridge
 
 def main():
-    # REPLACE THIS with your Uno Q's actual local Wi-Fi IP address 
-    BOARD_IP = "192.168.0.102" 
-    
-    print(f"Connecting to Diya's real-time core at {BOARD_IP}...")
-    
+    print(f"Connecting to {BOARD_IP}...")
+    time.sleep(3)
+
     try:
-        # Establish the network RPC connection to the board
-        client = rpc.Client(BOARD_IP)
+        response = Bridge.call("ping")
+        if response == 1:
+            print("Ping OK. Monitoring obstacles (within 100cm)...")
+        else:
+            print("Ping failed.")
+            return
     except Exception as e:
-        print(f"Error: Unable to reach the Arduino Uno Q. Details: {e}")
-        print("Check if the board is powered and your PC is on the same network.")
-        sys.exit(1)
-        
-    print("\n===========================================")
-    print("   DIYA ULTRASONIC SENSOR ARRAY STREAM   ")
-    print("===========================================")
-    print("Press Ctrl+C to terminate data stream.\n")
-    
+        print(f"Ping error: {e}")
+        return
+
+    # Track previous states
+    prev_left = -1   # Use -1 to force first print
+    prev_center = -1
+    prev_right = -1
+
+    print("-" * 40)
+
     try:
         while True:
-            # Query the specific memory slots updated by the C++ core
-            left = client.get("left_sensor")
-            center = client.get("center_sensor")
-            right = client.get("right_sensor")
-            
-            # Formats values dynamically on a single terminal line
-            # Values will display as '---' if they return a -1 error flag
-            left_str = f"{left:6.1f} cm" if left and left > 0 else "   ---   "
-            center_str = f"{center:6.1f} cm" if center and center > 0 else "   ---   "
-            right_str = f"{right:6.1f} cm" if right and right > 0 else "   ---   "
-            
-            sys.stdout.write(f"\r[Left]: {left_str}  |  [Center]: {center_str}  |  [Right]: {right_str}")
-            sys.stdout.flush()
-            
-            # Read rate matching the shared memory refresh cycle
-            time.sleep(0.08) 
-            
+            # Get obstacle status (should return 1 or 0)
+            left = Bridge.call("read_left")
+            center = Bridge.call("read_center")
+            right = Bridge.call("read_right")
+
+            # Ensure we have integers (convert None/False to 0)
+            left = 1 if left == 1 else 0
+            center = 1 if center == 1 else 0
+            right = 1 if right == 1 else 0
+
+            # Only print if any sensor state has changed
+            if left != prev_left or center != prev_center or right != prev_right:
+                # Build status string
+                status = ""
+                status += "L" if left else "-"
+                status += "C" if center else "-"
+                status += "R" if right else "-"
+
+                timestamp = time.strftime("%H:%M:%S")
+                print(f"[{timestamp}] Status: [{status}]")
+
+                # Update previous states
+                prev_left = left
+                prev_center = center
+                prev_right = right
+
+            # Small delay to prevent CPU overload and reduce flicker
+            time.sleep(0.05)
+
     except KeyboardInterrupt:
-        print("\n\nStream safely closed by user.")
+        print("\nStopped.")
 
 if __name__ == "__main__":
     main()
-
