@@ -2,81 +2,110 @@ import os
 import time
 import sys
 
-# Configuration
+# ============================================================
+# CONFIGURATION
+# ============================================================
 BOARD_IP = "192.168.0.102"
 os.environ["ARDUINO_BOARD_IP"] = BOARD_IP
-
 from arduino.app_utils import Bridge
 
-def monitor_obstacles(threshold_cm=100, update_interval=0.05):
+OBSTACLE_THRESHOLD_CM = 100   # for info only (Arduino uses its own)
+UPDATE_INTERVAL = 0.05        # 20 Hz
+
+
+# ============================================================
+# MAIN FUNCTION – monitors both obstacles and GPS
+# ============================================================
+
+def monitor_all(threshold_cm=100, update_interval=0.05):
     """
-    Continuously monitor ultrasonic sensors and print status when obstacles
-    are detected within the given threshold.
-
-    Args:
-        threshold_cm (int): Distance in cm to consider as obstacle.
-        update_interval (float): Sleep time between sensor reads (seconds).
-
-    Returns:
-        None (runs indefinitely until KeyboardInterrupt)
+    Continuously reads obstacle status and GPS data from the Arduino.
+    Prints any changes with timestamps.
     """
     print(f"Connecting to {BOARD_IP}...")
     time.sleep(3)
 
     # Ping the board
     try:
-        response = Bridge.call("ping")
-        if response == 1:
-            print(f"Ping OK. Monitoring obstacles within {threshold_cm}cm...")
-        else:
+        if Bridge.call("ping") != 1:
             print("Ping failed.")
             return
     except Exception as e:
         print(f"Ping error: {e}")
         return
 
-    # Track previous states to detect changes
-    prev_left = -1
-    prev_center = -1
-    prev_right = -1
+    print(f"Ping OK. Monitoring obstacles (within {threshold_cm}cm) and GPS.")
+    print("-" * 50)
 
-    print("-" * 40)
+    # ---------- Track previous states ----------
+    # Obstacles
+    prev_left = prev_center = prev_right = -1
+    # GPS
+    prev_lat = prev_lng = None
+    prev_fix = -1
 
     try:
         while True:
-            # Read raw obstacle status (1 = obstacle, 0 = clear)
+            changed = False
+            output_lines = []
+
+            # ---------- 1. Read Obstacles ----------
             left = Bridge.call("read_left")
             center = Bridge.call("read_center")
             right = Bridge.call("read_right")
-
-            # Normalize to 0/1 (safety against None or other values)
             left = 1 if left == 1 else 0
             center = 1 if center == 1 else 0
             right = 1 if right == 1 else 0
 
-            # Only print if any sensor state changed
             if left != prev_left or center != prev_center or right != prev_right:
                 status = ""
                 status += "L" if left else "-"
                 status += "C" if center else "-"
                 status += "R" if right else "-"
+                output_lines.append(f"Obstacles: [{status}]")
+                prev_left, prev_center, prev_right = left, center, right
+                changed = True
 
+            # ---------- 2. Read GPS ----------
+            lat = Bridge.call("get_lat")
+            lng = Bridge.call("get_lng")
+            fix = 1 if Bridge.call("get_gps_fix") == 1 else 0
+
+            # Convert None to 0.0
+            lat = float(lat) if lat is not None else 0.0
+            lng = float(lng) if lng is not None else 0.0
+            #print(lat,lng)
+            # GPS fix status change
+            if fix != prev_fix:
+                output_lines.append(f"GPS Fix: {'YES' if fix else 'NO'}")
+                prev_fix = fix
+                changed = True
+
+            # GPS coordinate change (only if we have a fix)
+            if fix and (lat != prev_lat or lng != prev_lng):
+                output_lines.append(f"Location: {lat:.6f}, {lng:.6f}")
+                prev_lat, prev_lng = lat, lng
+                changed = True
+
+            # ---------- Print if anything changed ----------
+            if changed:
                 timestamp = time.strftime("%H:%M:%S")
-                print(f"[{timestamp}] Status: [{status}]")
-
-                # Update previous states
-                prev_left = left
-                prev_center = center
-                prev_right = right
+                print(f"\n[{timestamp}]")
+                for line in output_lines:
+                    print(f"  {line}")
 
             time.sleep(update_interval)
 
     except KeyboardInterrupt:
         print("\nMonitoring stopped by user.")
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
 def main():
-    """Entry point for the script."""
-    monitor_obstacles()
+    monitor_all()
 
 if __name__ == "__main__":
     main()

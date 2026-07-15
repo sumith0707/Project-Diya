@@ -1,0 +1,25 @@
+┌─────────────────────────────────────────────────────────────┐
+│                    sketch.ino (MCU)                        │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │  SECTION 1: Hardware Definitions & Globals         │  │
+│  │  SECTION 2: GPS Feature (parse NMEA → lat/lng)    │  │
+│  │  SECTION 3: Ultrasonic Feature (obstacle detect)  │  │
+│  │  SECTION 4: RPC Callback Registration             │  │
+│  │  SECTION 5: setup() - Initialize all features     │  │
+│  │  SECTION 6: loop() - Run all features             │  │
+│  └─────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ RPC Bridge
+┌─────────────────────────────────────────────────────────────┐
+│                    main.py (MPU)                           │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │  SECTION 1: Imports & Configuration               │  │
+│  │  SECTION 2: Feature Functions                     │  │
+│  │    - monitor_obstacles()                          │  │
+│  │    - monitor_gps()                               │  │
+│  │    - [NEW FEATURE]()  ← ADD NEW FEATURES HERE   │  │
+│  │  SECTION 3: Main Coordinator Loop                │  │
+│  │  SECTION 4: Entry Point                          │  │
+│  └─────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘

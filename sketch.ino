@@ -1,55 +1,100 @@
 #include <Arduino_RouterBridge.h>
+#include <TinyGPS++.h>   // Add this library
 
+// ============================================================
+// ULTRASONIC SENSORS (unchanged)
+// ============================================================
 const int trigPins[3] = {9, 7, 5};
 const int echoPins[3] = {10, 8, 6};
 long duration;
-
-// Exponential moving average variables
 const float ALPHA = 0.6;
 float filtered[3] = {-1.0, -1.0, -1.0};
-
-// Threshold for obstacle detection (100cm)
 const float THRESHOLD_CM = 50.0;
-
-// Track previous state to avoid sending duplicate messages
 int previous_state[3] = {0, 0, 0};  // 0 = clear, 1 = obstacle
 
+// ============================================================
+// GPS MODULE – using hardware Serial1 (pins 0 and 1)
+// ============================================================
+#define gpsSerial Serial1    // Use hardware UART 1
+TinyGPSPlus gps;
+float current_lat = 0.0;
+float current_lng = 0.0;
+bool gps_fixed = false;
+
+// ============================================================
+// FUNCTION PROTOTYPES
+// ============================================================
+float getDistance(int trig, int echo);
+int checkObstacle(int sensor_index);
+void updateGPS();
+
+// RPC callbacks
+int getLeftStatus();
+int getCenterStatus();
+int getRightStatus();
+int pingHandler();
+float getLatitude();
+float getLongitude();
+int getGpsFix();
+
+// ============================================================
+// SETUP
+// ============================================================
 void setup() {
   Bridge.begin();
-  Serial.begin(9600);  // For debugging if needed
-  
+  Serial.begin(9600);       // USB Serial Monitor (debugging)
+
+  // ---- Ultrasonic pins ----
   for (int i = 0; i < 3; i++) {
     pinMode(trigPins[i], OUTPUT);
     pinMode(echoPins[i], INPUT);
     digitalWrite(trigPins[i], LOW);
   }
-  
-  // Register RPC callbacks
-  Bridge.provide("read_left",   getLeftStatus);
-  Bridge.provide("read_center", getCenterStatus);
-  Bridge.provide("read_right",  getRightStatus);
-  Bridge.provide("ping", pingHandler);
+
+  // ---- GPS ----
+  gpsSerial.begin(9600);    // NEO‑6M default baud rate
+
+  // ---- Register RPC callbacks ----
+  Bridge.provide("read_left",    getLeftStatus);
+  Bridge.provide("read_center",  getCenterStatus);
+  Bridge.provide("read_right",   getRightStatus);
+  Bridge.provide("ping",         pingHandler);
+  Bridge.provide("get_lat",      getLatitude);
+  Bridge.provide("get_lng",      getLongitude);
+  Bridge.provide("get_gps_fix",  getGpsFix);
 }
 
+// ============================================================
+// LOOP
+// ============================================================
+void loop() {
+  Bridge.update();          // Keep RPC bridge alive
+
+  // ---- Update GPS (non‑blocking) ----
+  updateGPS();
+
+  // (Optional) echo raw GPS data to Serial Monitor for debugging:
+  // while (gpsSerial.available()) Serial.write(gpsSerial.read());
+
+  delay(10);
+}
+
+// ============================================================
+// ULTRASONIC FUNCTIONS (unchanged)
+// ============================================================
 float getDistance(int trig, int echo) {
   digitalWrite(trig, LOW);
   delayMicroseconds(2);
   digitalWrite(trig, HIGH);
   delayMicroseconds(10);
   digitalWrite(trig, LOW);
-  duration = pulseIn(echo, HIGH);
-  
+  duration = pulseIn(echo, HIGH, 15000);   // 15ms timeout
   float raw_dist = (duration == 0) ? -1.0 : (duration * 0.034 / 2);
-  
-  // Apply exponential moving average
+
   int idx = (echo == echoPins[0]) ? 0 : (echo == echoPins[1]) ? 1 : 2;
-  
   if (raw_dist > 0) {
-    if (filtered[idx] < 0) {
-      filtered[idx] = raw_dist;
-    } else {
-      filtered[idx] = (ALPHA * raw_dist) + ((1 - ALPHA) * filtered[idx]);
-    }
+    if (filtered[idx] < 0) filtered[idx] = raw_dist;
+    else filtered[idx] = (ALPHA * raw_dist) + ((1 - ALPHA) * filtered[idx]);
     return filtered[idx];
   } else {
     filtered[idx] = -1.0;
@@ -57,45 +102,42 @@ float getDistance(int trig, int echo) {
   }
 }
 
-// Returns: 1 = obstacle detected, 0 = clear
 int checkObstacle(int sensor_index) {
   float dist = getDistance(trigPins[sensor_index], echoPins[sensor_index]);
-  
-  // Check if distance is valid and within threshold
-  if (dist > 0 && dist < THRESHOLD_CM) {
-    return 1;  // Obstacle detected
-  } else {
-    return 0;  // Clear path
+  return (dist > 0 && dist < THRESHOLD_CM) ? 1 : 0;
+}
+
+// RPC callbacks for ultrasonic
+int getLeftStatus()   { return checkObstacle(0); }
+int getCenterStatus() { return checkObstacle(1); }
+int getRightStatus()  { return checkObstacle(2); }
+
+// ============================================================
+// GPS FUNCTIONS
+// ============================================================
+void updateGPS() {
+  while (gpsSerial.available() > 0) {
+    char c = gpsSerial.read();
+    // Keep bridge alive even while parsing GPS
+    Bridge.update();
+    if (gps.encode(c)) {
+      if (gps.location.isValid()) {
+        current_lat = gps.location.lat();
+        current_lng = gps.location.lng();
+        gps_fixed = true;
+      } else {
+        gps_fixed = false;
+      }
+    }
   }
 }
 
-void loop() {
-  Bridge.update();
-  
-  // Optional: Print debug info to Serial
-  // Serial.print("L:");
-  // Serial.print(checkObstacle(0));
-  // Serial.print(" C:");
-  // Serial.print(checkObstacle(1));
-  // Serial.print(" R:");
-  // Serial.println(checkObstacle(2));
-  
-  delay(10);  // Small delay to prevent overwhelming the bridge
-}
+// RPC callbacks for GPS
+float getLatitude()  { return current_lat; }
+float getLongitude() { return current_lng; }
+int getGpsFix()      { return gps_fixed ? 1 : 0; }
 
-// RPC callback functions - return 1 for obstacle, 0 for clear
-int getLeftStatus() { 
-  return checkObstacle(0); 
-}
-
-int getCenterStatus() { 
-  return checkObstacle(1); 
-}
-
-int getRightStatus() { 
-  return checkObstacle(2); 
-}
-
-int pingHandler() { 
-  return 1; 
-}
+// ============================================================
+// SYSTEM CALLBACK
+// ============================================================
+int pingHandler() { return 1; }
