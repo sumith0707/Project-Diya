@@ -1,0 +1,5 @@
+id: osm_nav
+name: "OSM Step-by-Step Navigation Engine"
+description: "Handles offline-ready proximity calculation using OSRM data nodes."
+version: "1.0.0"
+category: navigation
