@@ -11,31 +11,33 @@ const float ALPHA = 0.6;
 float filtered[3] = {-1.0, -1.0, -1.0};
 const float THRESHOLD_CM = 50.0;
 int previous_state[3] = {0, 0, 0};  // 0 = clear, 1 = obstacle
+unsigned long previousMillis = 0;
+const unsigned long SEND_INTERVAL_MS = 50;
 
 // ============================================================
 // GPS MODULE – using hardware Serial1 (pins 0 and 1)
 // ============================================================
-#define gpsSerial Serial1    // Use hardware UART 1
-TinyGPSPlus gps;
-float current_lat = 0.0;
-float current_lng = 0.0;
-bool gps_fixed = false;
+// #define gpsSerial Serial1    // Use hardware UART 1
+// TinyGPSPlus gps;
+// float current_lat = 0.0;
+// float current_lng = 0.0;
+// bool gps_fixed = false;
 
 // ============================================================
 // FUNCTION PROTOTYPES
 // ============================================================
 float getDistance(int trig, int echo);
 int checkObstacle(int sensor_index);
-void updateGPS();
+// void updateGPS();
 
-// RPC callbacks
-int getLeftStatus();
-int getCenterStatus();
-int getRightStatus();
+// // RPC callbacks
+// int getLeftStatus();
+// int getCenterStatus();
+// int getRightStatus();
 int pingHandler();
-float getLatitude();
-float getLongitude();
-int getGpsFix();
+// float getLatitude();
+// float getLongitude();
+// int getGpsFix();
 
 // ============================================================
 // SETUP
@@ -52,16 +54,16 @@ void setup() {
   }
 
   // ---- GPS ----
-  gpsSerial.begin(9600);    // NEO‑6M default baud rate
+  // gpsSerial.begin(9600);    // NEO‑6M default baud rate
 
-  // ---- Register RPC callbacks ----
-  Bridge.provide("read_left",    getLeftStatus);
-  Bridge.provide("read_center",  getCenterStatus);
-  Bridge.provide("read_right",   getRightStatus);
-  Bridge.provide("ping",         pingHandler);
-  Bridge.provide("get_lat",      getLatitude);
-  Bridge.provide("get_lng",      getLongitude);
-  Bridge.provide("get_gps_fix",  getGpsFix);
+  // // ---- Register RPC callbacks ----
+  // Bridge.provide("read_left",    getLeftStatus);
+  // Bridge.provide("read_center",  getCenterStatus);
+  // Bridge.provide("read_right",   getRightStatus);
+  Bridge.provide("ping",pingHandler);
+  // Bridge.provide("get_lat",      getLatitude);
+  // Bridge.provide("get_lng",      getLongitude);
+  // Bridge.provide("get_gps_fix",  getGpsFix);
 }
 
 // ============================================================
@@ -69,16 +71,31 @@ void setup() {
 // ============================================================
 void loop() {
   Bridge.update();          // Keep RPC bridge alive
+  unsigned long currentMillis = millis();
 
+  // Send data at exactly 20Hz without blocking
+  if (currentMillis - previousMillis >= SEND_INTERVAL_MS) {
+    previousMillis = currentMillis;
+
+    // Read all three sensors
+    int left = checkObstacle(0);
+    int center = checkObstacle(1);
+    int right = checkObstacle(2);
+
+    // Pack as comma‑separated string
+    String data = String(left) + "," + String(center) + "," + String(right);
+
+    // Push to MPU
+    Bridge.notify("ultrasonic", data);
   // ---- Update GPS (non‑blocking) ----
-  updateGPS();
+  // updateGPS();
 
   // (Optional) echo raw GPS data to Serial Monitor for debugging:
   // while (gpsSerial.available()) Serial.write(gpsSerial.read());
 
-  delay(10);
+  //delay(10);
+  }
 }
-
 // ============================================================
 // ULTRASONIC FUNCTIONS (unchanged)
 // ============================================================
@@ -108,34 +125,34 @@ int checkObstacle(int sensor_index) {
 }
 
 // RPC callbacks for ultrasonic
-int getLeftStatus()   { return checkObstacle(0); }
-int getCenterStatus() { return checkObstacle(1); }
-int getRightStatus()  { return checkObstacle(2); }
+// int getLeftStatus()   { return checkObstacle(0); }
+// int getCenterStatus() { return checkObstacle(1); }
+// int getRightStatus()  { return checkObstacle(2); }
 
 // ============================================================
 // GPS FUNCTIONS
 // ============================================================
-void updateGPS() {
-  while (gpsSerial.available() > 0) {
-    char c = gpsSerial.read();
-    // Keep bridge alive even while parsing GPS
-    Bridge.update();
-    if (gps.encode(c)) {
-      if (gps.location.isValid()) {
-        current_lat = gps.location.lat();
-        current_lng = gps.location.lng();
-        gps_fixed = true;
-      } else {
-        gps_fixed = false;
-      }
-    }
-  }
-}
+// void updateGPS() {
+//   while (gpsSerial.available() > 0) {
+//     char c = gpsSerial.read();
+//     // Keep bridge alive even while parsing GPS
+//     Bridge.update();
+//     if (gps.encode(c)) {
+//       if (gps.location.isValid()) {
+//         current_lat = gps.location.lat();
+//         current_lng = gps.location.lng();
+//         gps_fixed = true;
+//       } else {
+//         gps_fixed = false;
+//       }
+//     }
+//   }
+// }
 
 // RPC callbacks for GPS
-float getLatitude()  { return current_lat; }
-float getLongitude() { return current_lng; }
-int getGpsFix()      { return gps_fixed ? 1 : 0; }
+// float getLatitude()  { return current_lat; }
+// float getLongitude() { return current_lng; }
+// int getGpsFix()      { return gps_fixed ? 1 : 0; }
 
 // ============================================================
 // SYSTEM CALLBACK

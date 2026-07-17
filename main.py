@@ -81,58 +81,66 @@ def on_gps(sid, message):
 ui.on_message("raw_text", on_raw_text)
 ui.on_message("gps", on_gps)
 
-# ========== Obstacle monitoring (runs in a background thread) ==========
-def monitor_obstacles(threshold_cm=100, update_interval=0.05):
-    print(f"Connecting to {BOARD_IP}...")
-    time.sleep(3)
+obstacle_data = {"left": 0, "center": 0, "right": 0}
+obstacle_lock = threading.Lock()
 
+# ========== Handler for ultrasonic notifications ==========
+def on_ultrasonic(data):
+    """Called when MCU pushes ultrasonic data via Bridge.notify()"""
     try:
-        response = Bridge.call("ping")
-        if response == 1:
-            print(f"Ping OK. Monitoring obstacles within {threshold_cm}cm...")
-        else:
-            print("Ping failed.")
-            return
+        # Data is a comma-separated string: "1,0,1"
+        parts = data.split(",")
+        if len(parts) == 3:
+            left = int(parts[0])
+            center = int(parts[1])
+            right = int(parts[2])
+            with obstacle_lock:
+                obstacle_data["left"] = left
+                obstacle_data["center"] = center
+                obstacle_data["right"] = right
+            # Optional: print only on change
+            # print(f"Ultrasonic: L={left}, C={center}, R={right}")
     except Exception as e:
-        print(f"Ping error: {e}")
-        return
+        print(f"Ultrasonic parse error: {e}")
 
-    prev_left = prev_center = prev_right = -1
+Bridge.provide("ultrasonic", on_ultrasonic)
 
-    print("-" * 40)
-    print("Obstacle monitor running.")
-    print("WebUI available at http://<BOARD_IP>:7000")
-    print("Send 'raw_text' for plain text, or 'gps' with JSON: {\"lat\": X, \"lng\": Y}")
-    print("-" * 40)
+# ========== Obstacle monitoring (runs in a background thread) ==========
+def monitor_obstacles(update_interval=0.05):
+    print("Obstacle monitor running (using Bridge.notify()).")
+    prev_state = (-1, -1, -1)
 
     try:
         while True:
-            left = Bridge.call("read_left")
-            center = Bridge.call("read_center")
-            right = Bridge.call("read_right")
+            with obstacle_lock:
+                left = obstacle_data["left"]
+                center = obstacle_data["center"]
+                right = obstacle_data["right"]
 
-            left = 1 if left == 1 else 0
-            center = 1 if center == 1 else 0
-            right = 1 if right == 1 else 0
-
-            if left != prev_left or center != prev_center or right != prev_right:
+            if (left, center, right) != prev_state:
                 status = ""
                 status += "L" if left else "-"
                 status += "C" if center else "-"
                 status += "R" if right else "-"
                 timestamp = time.strftime("%H:%M:%S")
                 print(f"[{timestamp}] Obstacles: [{status}]")
-                prev_left, prev_center, prev_right = left, center, right
-
-            # Optional: print current GPS every 5 seconds (for debugging)
-            # with gps_lock:
-            #     if gps_data["fix"] and (time.time() - gps_data["last_update"] < 10):
-            #         print(f"\r[GPS] {gps_data['lat']:.6f}, {gps_data['lng']:.6f}", end="")
+                prev_state = (left, center, right)
 
             time.sleep(update_interval)
-
     except KeyboardInterrupt:
-        print("\nObstacle monitor stopped.")
+        print("Obstacle monitor stopped.")
+
+def on_sos(state):
+    print("SOS Pressed")
+
+def on_mul(state):
+    if state == "short":
+        print("short press")
+    else:
+        print("long press")
+    
+Bridge.provide("SOS", on_sos)
+Bridge.provide("Mul_Pur", on_mul)
 
 # ========== Main entry point ==========
 def main():
