@@ -1,0 +1,4 @@
+faster-whisper
+sounddevice
+webrtcvad-wheels
+numpy

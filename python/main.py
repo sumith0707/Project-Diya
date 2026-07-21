@@ -12,6 +12,7 @@ from arduino.app_utils import Bridge, App
 from arduino.app_bricks.web_ui import WebUI
 from osm_nav import OsmNavigationEngine
 from emergency_manager import EmergencyManager
+from voice_recognition import VoiceRecognition
 
 sos_timer = None          # Timer object for delayed SOS
 sos_active = False        # True while waiting for SOS confirmation
@@ -33,6 +34,22 @@ gps_data = {
 }
 gps_lock = threading.Lock()
 
+# ========== Voice Recognition Setup ==========
+
+try:
+    voice = VoiceRecognition(
+        model_name="tiny",      # Use tiny model
+        device="cpu",
+        compute_type="int8",    # Optimized for CPU
+        block_duration_ms=30,
+        silence_timeout=1.5,
+        vad_mode=1
+    )
+    print("Voice recognition engine ready (Faster Whisper tiny).")
+except Exception as e:
+    print(f"Failed to initialize Faster Whisper: {e}")
+    voice = None
+    
 # # ========== WebSocket handler for raw text ==========
 def on_raw_text(sid, message):
     print(f"\n[Raw Text] Client {sid} sent: {message}")
@@ -181,11 +198,27 @@ def on_sos(state):
     elif state == "sos_cancel":
         emergency.cancel_emergency()     # ← Cancel timer
 
+def handle_voice_result(text):
+    """Called when Vosk successfully recognizes speech."""
+    print(f"[Voice Result] {text}")
+    # Send to WebUI
+    ui.send_message("voice_command", text)
+    # You can add command parsing here, e.g.:
+    # if "navigate" in text.lower():
+    #     # extract destination and start navigation
+    #     pass
+
 def on_mul(state):
+    print(f"[Mul_Pur] Button pressed: {state}")
+    if voice is None:
+        print("Voice recognition not available.")
+        return
     if state == "short":
-        print("short press")
-    else:
-        print("long press")
+        print("Starting voice recognition...")
+        voice.start_recording(callback=handle_voice_result)
+    else:  # long press
+        print("Cancelling voice recognition...")
+        voice.stop_recording()
     
 Bridge.provide("SOS", on_sos)
 Bridge.provide("Mul_Pur", on_mul)
