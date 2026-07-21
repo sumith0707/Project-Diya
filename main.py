@@ -11,9 +11,14 @@ os.environ["ARDUINO_BOARD_IP"] = BOARD_IP
 from arduino.app_utils import Bridge, App
 from arduino.app_bricks.web_ui import WebUI
 from osm_nav import OsmNavigationEngine
+from emergency_manager import EmergencyManager
+
+sos_timer = None          # Timer object for delayed SOS
+sos_active = False        # True while waiting for SOS confirmation
 
 # ========== WebUI instance ==========
 ui = WebUI()
+emergency = EmergencyManager(ui)
 
 # Hardcoded destination name string (e.g., "Majestic, Bengaluru")
 DESTINATION_NAME = "Mangalore" 
@@ -130,8 +135,51 @@ def monitor_obstacles(update_interval=0.05):
     except KeyboardInterrupt:
         print("Obstacle monitor stopped.")
 
+# def send_sos():
+#     """Called after 5 seconds if SOS is not cancelled."""
+#     global sos_active, sos_timer
+#     print("[SOS] Timer expired – sending SOS alert!")
+#     ui.send_message("sos", "SOS")   # Broadcast to all clients
+#     sos_active = False
+#     sos_timer = None
+
+# # ========== SOS Handler ==========
+# def on_sos(state):
+#     global sos_active, sos_timer
+#     print(f"[SOS] Received state: {state}")
+
+#     if state == "sos":
+#         # Short press – start timer
+#         if sos_active:
+#             # Cancel any existing timer (shouldn't happen normally)
+#             if sos_timer:
+#                 sos_timer.cancel()
+#                 sos_timer = None
+#         # Start new 5-second timer
+#         sos_active = True
+#         sos_timer = threading.Timer(5.0, send_sos)
+#         sos_timer.start()
+#         print("[SOS] Timer started – waiting 5 seconds for cancellation.")
+
+#     elif state == "sos_cancel":
+#         # Long press – cancel if timer is active
+#         if sos_active:
+#             if sos_timer:
+#                 sos_timer.cancel()
+#                 sos_timer = None
+#             sos_active = False
+#             print("[SOS] Cancelled – no alert sent.")
+#             ui.send_message("sos", "SOS_CANCELLED")   # Optional: inform UI
+#         else:
+#             # Long press without active timer – ignore
+#             print("[SOS] Long press ignored (no active SOS).")
+
 def on_sos(state):
-    print("SOS Pressed")
+    #print(f"[SOS] SOS state: {state}")
+    if state == "sos":
+        emergency.trigger_emergency()   # ← Start timer
+    elif state == "sos_cancel":
+        emergency.cancel_emergency()     # ← Cancel timer
 
 def on_mul(state):
     if state == "short":

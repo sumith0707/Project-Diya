@@ -13,3 +13,8 @@ socket.on("reply", (msg) => {
     console.log(msg);
     document.getElementById("output").innerText = msg;
 });
+
+socket.on("sos", (msg) => {
+    console.log(msg);
+    document.getElementById("sos").innerText = msg;
+});

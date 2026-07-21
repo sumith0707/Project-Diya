@@ -1,5 +1,5 @@
 #include <Arduino_RouterBridge.h>
-#include <TinyGPS++.h>   // Add this library
+#include <OneButton.h>   // Add this library
 
 // ============================================================
 // ULTRASONIC SENSORS (unchanged)
@@ -13,7 +13,8 @@ const float THRESHOLD_CM = 50.0;
 int previous_state[3] = {0, 0, 0};  // 0 = clear, 1 = obstacle
 unsigned long previousMillis = 0;
 const unsigned long SEND_INTERVAL_MS = 50;
-
+OneButton button(3, true);
+OneButton sos_but(4, true);
 // ============================================================
 // GPS MODULE – using hardware Serial1 (pins 0 and 1)
 // ============================================================
@@ -45,7 +46,11 @@ int pingHandler();
 void setup() {
   Bridge.begin();
   Serial.begin(9600);       // USB Serial Monitor (debugging)
-
+  button.attachClick(shortClick);
+  button.attachLongPressStop(longClick);
+  sos_but.attachClick(shortClick_sos);
+  sos_but.attachLongPressStop(longClick_sos);
+  pinMode(4, INPUT_PULLUP);
   // ---- Ultrasonic pins ----
   for (int i = 0; i < 3; i++) {
     pinMode(trigPins[i], OUTPUT);
@@ -70,9 +75,10 @@ void setup() {
 // LOOP
 // ============================================================
 void loop() {
-  Bridge.update();          // Keep RPC bridge alive
+  Bridge.update();   
+  button.tick();
+  sos_but.tick();// Keep RPC bridge alive
   unsigned long currentMillis = millis();
-
   // Send data at exactly 20Hz without blocking
   if (currentMillis - previousMillis >= SEND_INTERVAL_MS) {
     previousMillis = currentMillis;
@@ -96,6 +102,23 @@ void loop() {
   //delay(10);
   }
 }
+
+void shortClick_sos() {
+  Bridge.notify("SOS", "sos");
+}
+
+void longClick_sos() {
+  Bridge.notify("SOS", "sos_cancel");
+}
+
+void shortClick() {
+  Bridge.notify("Mul_Pur", "short");
+}
+
+void longClick() {
+  Bridge.notify("Mul_Pur", "long");
+}
+
 // ============================================================
 // ULTRASONIC FUNCTIONS (unchanged)
 // ============================================================
