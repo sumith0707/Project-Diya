@@ -13,17 +13,30 @@ from arduino.app_bricks.web_ui import WebUI
 from osm_nav import OsmNavigationEngine
 from emergency_manager import EmergencyManager
 from voice_recognition import VoiceRecognition
+from imu_module import IMUReader
 
 sos_timer = None          # Timer object for delayed SOS
 sos_active = False        # True while waiting for SOS confirmation
 
 # ========== WebUI instance ==========
 ui = WebUI()
-emergency = EmergencyManager(ui)
 
 # Hardcoded destination name string (e.g., "Majestic, Bengaluru")
 DESTINATION_NAME = "Mangalore" 
 nav_engine = OsmNavigationEngine(destination_name=DESTINATION_NAME)
+# ========== IMU Setup ==========
+try:
+    imu = IMUReader()
+    nav_engine.set_imu(imu)
+    print("IMU ready for turn detection.")
+except Exception as e:
+    print(f"IMU initialization failed: {e}")
+    nav_engine.set_imu(None)
+
+# ========== Emergency Manager ==========
+emergency = EmergencyManager(imu=imu)  # Pass IMU for fall detection
+emergency.set_ui(ui)                    # Set UI for sending messages
+emergency.start_fall_detection()        # Start fall detection thread
 
 # ========== Shared GPS data (for future use) ==========
 gps_data = {
@@ -192,11 +205,10 @@ def monitor_obstacles(update_interval=0.05):
 #             print("[SOS] Long press ignored (no active SOS).")
 
 def on_sos(state):
-    #print(f"[SOS] SOS state: {state}")
     if state == "sos":
-        emergency.trigger_emergency()   # ← Start timer
+        emergency.trigger_emergency(source="button")
     elif state == "sos_cancel":
-        emergency.cancel_emergency()     # ← Cancel timer
+        emergency.cancel_emergency()
 
 def handle_voice_result(text):
     """Called when Vosk successfully recognizes speech."""

@@ -1,8 +1,10 @@
 #include <Arduino_RouterBridge.h>
-#include <OneButton.h>   // Add this library
+#include <OneButton.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
 // ============================================================
-// ULTRASONIC SENSORS (unchanged)
+// ULTRASONIC SENSORS
 // ============================================================
 const int trigPins[3] = {9, 7, 5};
 const int echoPins[3] = {10, 8, 6};
@@ -10,47 +12,55 @@ long duration;
 const float ALPHA = 0.6;
 float filtered[3] = {-1.0, -1.0, -1.0};
 const float THRESHOLD_CM = 50.0;
-int previous_state[3] = {0, 0, 0};  // 0 = clear, 1 = obstacle
 unsigned long previousMillis = 0;
 const unsigned long SEND_INTERVAL_MS = 50;
+
+// ============================================================
+// BUTTONS
+// ============================================================
 OneButton button(3, true);
 OneButton sos_but(4, true);
+
 // ============================================================
-// GPS MODULE – using hardware Serial1 (pins 0 and 1)
+// IMU (MPU6050)
 // ============================================================
-// #define gpsSerial Serial1    // Use hardware UART 1
-// TinyGPSPlus gps;
-// float current_lat = 0.0;
-// float current_lng = 0.0;
-// bool gps_fixed = false;
+Adafruit_MPU6050 mpu;
+float heading = 0.0;
+unsigned long lastIMURead = 0;
+const unsigned long IMU_UPDATE_INTERVAL = 100;
 
 // ============================================================
 // FUNCTION PROTOTYPES
 // ============================================================
 float getDistance(int trig, int echo);
 int checkObstacle(int sensor_index);
-// void updateGPS();
-
-// // RPC callbacks
-// int getLeftStatus();
-// int getCenterStatus();
-// int getRightStatus();
 int pingHandler();
-// float getLatitude();
-// float getLongitude();
-// int getGpsFix();
+float getIMUHeading();
+void initIMU();
+
+String getAccelerometer() {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    
+    // These should already be in m/s²
+    // But if they're not, apply scaling based on the configured range
+    // For MPU6050_RANGE_8_G, divide by 4096 to get g, then multiply by 9.80665
+    
+    // Option A: Trust Adafruit library (recommended)
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "%.2f,%.2f,%.2f", 
+             a.acceleration.x, a.acceleration.y, a.acceleration.z);
+    return String(buffer);
+}
 
 // ============================================================
 // SETUP
 // ============================================================
 void setup() {
   Bridge.begin();
-  Serial.begin(9600);       // USB Serial Monitor (debugging)
-  button.attachClick(shortClick);
-  button.attachLongPressStop(longClick);
-  sos_but.attachClick(shortClick_sos);
-  sos_but.attachLongPressStop(longClick_sos);
-  pinMode(4, INPUT_PULLUP);
+  Serial.begin(9600);
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);   // 8g range
+  Bridge.provide("get_accel", getAccelerometer);
   // ---- Ultrasonic pins ----
   for (int i = 0; i < 3; i++) {
     pinMode(trigPins[i], OUTPUT);
@@ -58,69 +68,48 @@ void setup() {
     digitalWrite(trigPins[i], LOW);
   }
 
-  // ---- GPS ----
-  // gpsSerial.begin(9600);    // NEO‑6M default baud rate
+  // ---- Buttons ----
+  button.attachClick(shortClick);
+  button.attachLongPressStop(longClick);
+  sos_but.attachClick(shortClick_sos);
+  sos_but.attachLongPressStop(longClick_sos);
+  pinMode(4, INPUT_PULLUP);
 
-  // // ---- Register RPC callbacks ----
-  // Bridge.provide("read_left",    getLeftStatus);
-  // Bridge.provide("read_center",  getCenterStatus);
-  // Bridge.provide("read_right",   getRightStatus);
-  Bridge.provide("ping",pingHandler);
-  // Bridge.provide("get_lat",      getLatitude);
-  // Bridge.provide("get_lng",      getLongitude);
-  // Bridge.provide("get_gps_fix",  getGpsFix);
+  // ---- IMU ----
+  initIMU();
+
+  // ---- RPC Callbacks ----
+  Bridge.provide("ping", pingHandler);
+  Bridge.provide("get_heading", getIMUHeading);
 }
 
 // ============================================================
 // LOOP
 // ============================================================
 void loop() {
-  Bridge.update();   
+  Bridge.update();
   button.tick();
-  sos_but.tick();// Keep RPC bridge alive
+  sos_but.tick();
+
+  // ---- Ultrasonic (20Hz notify) ----
   unsigned long currentMillis = millis();
-  // Send data at exactly 20Hz without blocking
   if (currentMillis - previousMillis >= SEND_INTERVAL_MS) {
     previousMillis = currentMillis;
 
-    // Read all three sensors
     int left = checkObstacle(0);
     int center = checkObstacle(1);
     int right = checkObstacle(2);
 
-    // Pack as comma‑separated string
     String data = String(left) + "," + String(center) + "," + String(right);
-
-    // Push to MPU
     Bridge.notify("ultrasonic", data);
-  // ---- Update GPS (non‑blocking) ----
-  // updateGPS();
-
-  // (Optional) echo raw GPS data to Serial Monitor for debugging:
-  // while (gpsSerial.available()) Serial.write(gpsSerial.read());
-
-  //delay(10);
   }
-}
 
-void shortClick_sos() {
-  Bridge.notify("SOS", "sos");
-}
-
-void longClick_sos() {
-  Bridge.notify("SOS", "sos_cancel");
-}
-
-void shortClick() {
-  Bridge.notify("Mul_Pur", "short");
-}
-
-void longClick() {
-  Bridge.notify("Mul_Pur", "long");
+  // ---- IMU heading is read on-demand via Bridge.call() ----
+  // No continuous reading/notify – this is the request-response approach.
 }
 
 // ============================================================
-// ULTRASONIC FUNCTIONS (unchanged)
+// ULTRASONIC FUNCTIONS
 // ============================================================
 float getDistance(int trig, int echo) {
   digitalWrite(trig, LOW);
@@ -128,7 +117,7 @@ float getDistance(int trig, int echo) {
   digitalWrite(trig, HIGH);
   delayMicroseconds(10);
   digitalWrite(trig, LOW);
-  duration = pulseIn(echo, HIGH, 15000);   // 15ms timeout
+  duration = pulseIn(echo, HIGH, 15000);
   float raw_dist = (duration == 0) ? -1.0 : (duration * 0.034 / 2);
 
   int idx = (echo == echoPins[0]) ? 0 : (echo == echoPins[1]) ? 1 : 2;
@@ -147,37 +136,61 @@ int checkObstacle(int sensor_index) {
   return (dist > 0 && dist < THRESHOLD_CM) ? 1 : 0;
 }
 
-// RPC callbacks for ultrasonic
-// int getLeftStatus()   { return checkObstacle(0); }
-// int getCenterStatus() { return checkObstacle(1); }
-// int getRightStatus()  { return checkObstacle(2); }
+// ============================================================
+// IMU FUNCTIONS
+// ============================================================
+void initIMU() {
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found!");
+    return;
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.println("MPU6050 ready.");
+}
+
+float getIMUHeading() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  static float yaw = 0.0;
+  static unsigned long lastTime = micros();
+  unsigned long currentTime = micros();
+  float dt = (currentTime - lastTime) / 1000000.0;
+  lastTime = currentTime;
+
+  // Gyro Z in degrees per second (convert from rad/s)
+  float gyroZ = g.gyro.z * 180.0 / PI;
+  yaw += gyroZ * dt;
+
+  // Normalize to 0-360
+  if (yaw < 0) yaw += 360;
+  if (yaw >= 360) yaw -= 360;
+
+  return yaw;
+}
 
 // ============================================================
-// GPS FUNCTIONS
+// BUTTON CALLBACKS
 // ============================================================
-// void updateGPS() {
-//   while (gpsSerial.available() > 0) {
-//     char c = gpsSerial.read();
-//     // Keep bridge alive even while parsing GPS
-//     Bridge.update();
-//     if (gps.encode(c)) {
-//       if (gps.location.isValid()) {
-//         current_lat = gps.location.lat();
-//         current_lng = gps.location.lng();
-//         gps_fixed = true;
-//       } else {
-//         gps_fixed = false;
-//       }
-//     }
-//   }
-// }
+void shortClick_sos() {
+  Bridge.notify("SOS", "sos");
+}
 
-// RPC callbacks for GPS
-// float getLatitude()  { return current_lat; }
-// float getLongitude() { return current_lng; }
-// int getGpsFix()      { return gps_fixed ? 1 : 0; }
+void longClick_sos() {
+  Bridge.notify("SOS", "sos_cancel");
+}
+
+void shortClick() {
+  Bridge.notify("Mul_Pur", "short");
+}
+
+void longClick() {
+  Bridge.notify("Mul_Pur", "long");
+}
 
 // ============================================================
-// SYSTEM CALLBACK
+// SYSTEM CALLBACKS
 // ============================================================
 int pingHandler() { return 1; }

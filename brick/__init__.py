@@ -3,6 +3,7 @@ import time
 import requests
 import threading
 from arduino.app_utils import brick
+from imu_module import IMUReader
 
 class GeoMath:
     @staticmethod
@@ -32,22 +33,36 @@ class OsmNavigationEngine:
         
         self.is_navigating = False
         self.route_initialized = False
-        self.trigger_radius = 15  # Distance threshold to switch steps (meters)
-        self.reroute_threshold = 100  # If distance to next turn exceeds this, check for reroute
+        self.trigger_radius = 15
+        self.reroute_threshold = 100
 
-        # ========== Thread safety ==========
-        self._lock = threading.RLock()  # Reentrant lock for shared state
+        # Thread safety
+        self._lock = threading.RLock()
 
-        # ========== Error recovery: retry settings ==========
+        # Error recovery
         self._retry_attempts = 3
-        self._retry_delay = 2  # seconds
+        self._retry_delay = 2
 
-        # ========== Direction detection (prevent false reroutes) ==========
+        # Direction detection
         self.last_distance_to_turn = None
 
-        # ========== Debounce (prevent GPS jitter from triggering reroute) ==========
+        # Debounce
         self.off_route_count = 0
-        self.off_route_threshold = 3  # Require 3 consecutive off-route readings
+        self.off_route_threshold = 3
+
+        # IMU turn confirmation
+        self.imu = None
+        self.waiting_for_turn = False
+        self.turn_start_heading = None
+        self.turn_start_time = None
+        self.turn_timeout = 15
+        self.turn_threshold = 30
+        self.turn_direction = None
+
+    def set_imu(self, imu_reader):
+        """Set the IMU reader instance."""
+        self.imu = imu_reader
+        print("[OSM Nav] IMU reader attached.")
 
     def _resolve_destination_coords(self):
         """Resolves the hardcoded text string into coordinate pairs using OSM Nominatim."""
@@ -107,7 +122,6 @@ class OsmNavigationEngine:
                             self.active_step = self.steps_queue.pop(0)
                             self.is_navigating = True
                             self.route_initialized = True
-                            # Reset tracking variables for the new route
                             self.last_distance_to_turn = None
                             self.off_route_count = 0
                             self.announce_current_step()
@@ -130,7 +144,6 @@ class OsmNavigationEngine:
             self.current_lat = lat
             self.current_lon = lon
         
-        # Trigger route initialization once we have valid coords and destination is resolved
         if not self.route_initialized and lat != 0.0 and lon != 0.0:
             if self._resolve_destination_coords():
                 self.initialize_route()
@@ -147,7 +160,6 @@ class OsmNavigationEngine:
         modifier = maneuver.get("modifier", "")
         street = step.get("name", "").strip()
     
-        # Modifier mapping for more natural speech
         modifier_map = {
             "right": "to the right",
             "left": "to the left",
@@ -159,23 +171,19 @@ class OsmNavigationEngine:
             "uturn": "around"
         }
     
-        # Build instruction based on maneuver type
         if m_type == "depart":
             if street:
                 text = f"Proceed onto {street}."
             else:
                 mod_text = modifier_map.get(modifier, modifier)
                 text = f"Proceed {mod_text}."
-    
         elif "turn" in m_type:
             if street:
                 text = f"Turn {modifier} onto {street}."
             else:
                 text = f"Turn {modifier}."
-    
         elif m_type == "arrive":
             text = f"You have arrived at your destination."
-    
         else:
             if street:
                 text = f"Continue along {street}."
@@ -187,22 +195,34 @@ class OsmNavigationEngine:
     def reroute(self):
         """Force a reroute from the current position to the destination."""
         print("[OSM Nav] Rerouting...")
+        self.waiting_for_turn = False
         with self._lock:
-            # Reset navigation state before reinitializing
             self.is_navigating = False
             self.route_initialized = False
             self.steps_queue = []
             self.active_step = None
-            # Reset tracking variables for the new route
             self.last_distance_to_turn = None
             self.off_route_count = 0
-        # Re-initialise the route using fresh GPS
         self.initialize_route()
+
+    def _advance_to_next_step(self):
+        """Advance to the next step in the queue (or finish navigation)."""
+        with self._lock:
+            if self.steps_queue:
+                self.active_step = self.steps_queue.pop(0)
+                self.last_distance_to_turn = None
+                self.off_route_count = 0
+                self.announce_current_step()
+            else:
+                print(f"\n>>>> [DIYA NAVIGATION DIRECTIVE]: You have arrived at your destination: {self.destination_name} <<<<\n")
+                self.is_navigating = False
+                self.active_step = None
+                self.route_initialized = False
+                self.waiting_for_turn = False
 
     @brick.loop
     def process_navigation(self):
         """Continuously computes proximity constraints on the active background thread."""
-        # Snapshot current state with lock
         with self._lock:
             if not self.is_navigating or not self.active_step or not self.current_lat:
                 time.sleep(1)
@@ -212,26 +232,18 @@ class OsmNavigationEngine:
             current_lon = self.current_lon
             steps_queue_exists = bool(self.steps_queue)
 
-        # Target step coordinate arrays are provided in [longitude, latitude] format
         target_lon, target_lat = active_step["maneuver"]["location"]
-        
-        # Compute distance to the next turn
         distance_to_turn = GeoMath.distance_in_meters(
             current_lat, current_lon, target_lat, target_lon
         )
 
         # ========== ROUTE REFRESH WITH DIRECTION DETECTION + DEBOUNCE ==========
         if self.last_distance_to_turn is not None and self.route_initialized:
-            # Check if we're moving AWAY from the turn
             if distance_to_turn > self.last_distance_to_turn:
-                # Moving away from the turn point
                 if distance_to_turn > self.reroute_threshold:
-                    # We're off-route AND moving away - increment debounce counter
                     self.off_route_count += 1
                     print(f"[OSM Nav] Off-route detection {self.off_route_count}/{self.off_route_threshold} - Distance: {distance_to_turn:.1f}m")
-                    
                     if self.off_route_count >= self.off_route_threshold:
-                        # 3 consecutive off-route readings - trigger reroute
                         if steps_queue_exists or self.active_step:
                             print(f"[OSM Nav] Off-route confirmed! Rerouting...")
                             self.reroute()
@@ -240,32 +252,70 @@ class OsmNavigationEngine:
                             time.sleep(1)
                             return
                 else:
-                    # Moving away but still within threshold - reset count
                     self.off_route_count = 0
             else:
-                # Moving towards the turn - reset off-route counter
                 if self.off_route_count > 0:
                     self.off_route_count = 0
                     print("[OSM Nav] Back on route - reset off-route counter")
         
-        # Update last distance for next iteration
         self.last_distance_to_turn = distance_to_turn
+
+        # ========== TURN CONFIRMATION LOGIC ==========
+        is_turn_step = False
+        turn_modifier = None
+        if self.active_step:
+            maneuver = self.active_step.get("maneuver", {})
+            m_type = maneuver.get("type", "")
+            modifier = maneuver.get("modifier", "")
+            if "turn" in m_type and modifier in ("left", "right"):
+                is_turn_step = True
+                turn_modifier = modifier
+
+        if self.waiting_for_turn:
+            if self.imu is None:
+                print("[OSM Nav] IMU not available – skipping turn confirmation.")
+                self.waiting_for_turn = False
+                self._advance_to_next_step()
+                time.sleep(1)
+                return
+
+            current_heading = self.imu.get_heading()
+            heading_change = self.imu.get_relative_heading(self.turn_start_heading)
+
+            expected_sign = -1 if self.turn_direction == "left" else 1
+            if expected_sign * heading_change > self.turn_threshold:
+                print(f"[OSM Nav] Turn confirmed! Heading changed by {heading_change:.1f}°.")
+                self.waiting_for_turn = False
+                self._advance_to_next_step()
+                time.sleep(1)
+                return
+
+            if time.time() - self.turn_start_time > self.turn_timeout:
+                print(f"[OSM Nav] Turn not detected within {self.turn_timeout}s – rerouting.")
+                self.waiting_for_turn = False
+                self.reroute()
+                time.sleep(1)
+                return
+
+            time.sleep(0.5)
+            return
 
         # ========== STEP ADVANCEMENT ==========
         if distance_to_turn < self.trigger_radius:
-            print(f"[OSM Nav] Checkpoint reached! Turning node passed.")
-            with self._lock:
-                if self.steps_queue:
-                    self.active_step = self.steps_queue.pop(0)
-                    # Reset tracking variables for the new step
-                    self.last_distance_to_turn = None
-                    self.off_route_count = 0
+            if is_turn_step and self.imu is not None:
+                if not self.waiting_for_turn:
+                    print(f"[OSM Nav] Preparing for {turn_modifier} turn. Waiting for IMU confirmation...")
+                    self.waiting_for_turn = True
+                    self.turn_start_heading = self.imu.get_heading()
+                    self.turn_start_time = time.time()
+                    self.turn_direction = turn_modifier
                     self.announce_current_step()
+                    time.sleep(1)
+                    return
                 else:
-                    # No more steps – arrived
-                    print(f"\n>>>> [DIYA NAVIGATION DIRECTIVE]: You have arrived at your destination: {self.destination_name} <<<<\n")
-                    self.is_navigating = False
-                    self.active_step = None
-                    self.route_initialized = False
-
-        time.sleep(1)
+                    time.sleep(0.5)
+                    return
+            else:
+                self._advance_to_next_step()
+                time.sleep(1)
+                return
