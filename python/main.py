@@ -3,6 +3,8 @@ import time
 import sys
 import threading
 import json
+import cv2
+import numpy as np
 
 # ========== Configuration ==========
 BOARD_IP = "192.168.0.105"   # CHANGE to your board's actual IP
@@ -10,6 +12,7 @@ os.environ["ARDUINO_BOARD_IP"] = BOARD_IP
 
 from arduino.app_utils import Bridge, App
 from arduino.app_bricks.web_ui import WebUI
+from arduino.app_bricks.video_imageclassification import VideoImageClassification
 from osm_nav import OsmNavigationEngine
 from emergency_manager import EmergencyManager
 from voice_recognition import VoiceRecognition
@@ -112,6 +115,15 @@ def on_gps(sid, message):
     except Exception as e:
         print(f"\n[GPS] Error: {e}")
 
+# ========== Currency Detector ==========
+currency_detector = CurrencyDetector(confidence_threshold=0.5)
+
+def on_currency_detected(label):
+    """Called when currency is confirmed."""
+    print(f"[Currency] CONFIRMED: {label}")
+    # Optional: Send to WebUI
+    # ui.send_message("currency", {"label": label})
+
 # ========== Register handlers ==========
 ui.on_message("raw_text", on_raw_text)
 ui.on_message("gps", on_gps)
@@ -213,15 +225,35 @@ def on_sos(state):
 def handle_voice_result(text):
     """Called when Vosk successfully recognizes speech."""
     print(f"[Voice Result] {text}")
-    # Send to WebUI
     ui.send_message("voice_command", text)
-    # You can add command parsing here, e.g.:
-    # if "navigate" in text.lower():
-    #     # extract destination and start navigation
-    #     pass
+
+    # ---- Currency Detection ----
+    if "detect money" in text.lower() or "identify money" in text.lower():
+        print("[Voice] Starting currency detection...")
+        currency_detector.start(callback=on_currency_detected)
+        return
+
+    # ---- Navigation ----
+    # if "start" in text.lower():
+    #     print("Nav starting")
+    #     nav_engine.update_live_gps(lat2, lng2)
+    #     return
+
+    # # ---- Other commands ----
+    # print(f"[Voice] Command not recognized: {text}")
 
 def on_mul(state):
     print(f"[Mul_Pur] Button pressed: {state}")
+
+    # ---- If currency detection is running, cancel it ----
+    if currency_detector.is_running:
+        if state == "long":
+            print("Cancelling currency detection...")
+            currency_detector.stop()
+            print("[Currency] Cancelled by user.")
+        return
+
+    # ---- Voice recognition ----
     if voice is None:
         print("Voice recognition not available.")
         return
@@ -235,6 +267,102 @@ def on_mul(state):
 Bridge.provide("SOS", on_sos)
 Bridge.provide("Mul_Pur", on_mul)
 
+# ============================================================
+# Currency Detection
+# ============================================================
+class CurrencyDetector:
+    def __init__(self, confidence_threshold=0.5):
+        self.classifier = VideoImageClassification(confidence=confidence_threshold, debounce_sec=0.0)
+        self.confidence_threshold = confidence_threshold
+        self.is_running = False
+        self.last_label = None
+        self.detection_start_time = None
+        self.detection_duration = 2.0  # seconds
+        self.callback = None
+
+    def start(self, callback=None):
+        """Start currency detection in background thread."""
+        if self.is_running:
+            print("[Currency] Already running.")
+            return
+        self.is_running = True
+        self.callback = callback
+        self.last_label = None
+        self.detection_start_time = None
+        thread = threading.Thread(target=self._detection_loop, daemon=True)
+        thread.start()
+        print("[Currency] Detection started.")
+
+    def stop(self):
+        """Stop currency detection."""
+        self.is_running = False
+        print("[Currency] Detection stopped.")
+
+    def _detection_loop(self):
+        """Continuous detection loop."""
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("[Currency] ERROR: Camera not found.")
+            self.is_running = False
+            return
+
+        try:
+            while self.is_running:
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+
+                # Preprocess: resize to 224x224, convert BGR to RGB
+                resized = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_LINEAR)
+                rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+
+                # Classify
+                results = self.classifier.classify(rgb)
+                self._process_results(results)
+
+                time.sleep(0.05)  # 20 FPS
+
+        except Exception as e:
+            print(f"[Currency] Error: {e}")
+        finally:
+            cap.release()
+            self.is_running = False
+            print("[Currency] Detection loop ended.")
+
+    def _process_results(self, results):
+        """Process classification results."""
+        if not results:
+            self.last_label = None
+            self.detection_start_time = None
+            return
+
+        # Get best label
+        best = max(results.items(), key=lambda x: x[1])
+        label, confidence = best
+
+        if confidence < self.confidence_threshold:
+            self.last_label = None
+            self.detection_start_time = None
+            return
+
+        now = time.time()
+
+        if label == self.last_label:
+            # Same label detected
+            if self.detection_start_time is None:
+                self.detection_start_time = now
+            elif now - self.detection_start_time >= self.detection_duration:
+                # Confirmed for 2 seconds!
+                print(f"[Currency] CONFIRMED: {label}")
+                self.is_running = False
+                if self.callback:
+                    self.callback(label)
+        else:
+            # Different label – reset
+            self.last_label = label
+            self.detection_start_time = now
+            print(f"[Currency] Detected: {label} ({confidence:.2f})")
+            
 # ========== Main entry point ==========
 def main():
     print("=" * 50)
