@@ -115,8 +115,92 @@ def on_gps(sid, message):
     except Exception as e:
         print(f"\n[GPS] Error: {e}")
 
+# ============================================================
+# Currency Detection
+# ============================================================
+# ============================================================
+# Currency Detection (Based on Working Example)
+# ============================================================
+class CurrencyDetector:
+    def __init__(self, confidence_threshold=0.5):
+        self.classifier = VideoImageClassification(confidence=confidence_threshold, debounce_sec=0.0)
+        self.confidence_threshold = confidence_threshold
+        self.is_running = False
+        self.last_label = None
+        self.detection_start_time = None
+        self.detection_duration = 2.0
+        self.callback = None
+
+        # ---- Register the callback using a wrapper function ----
+        # The brick expects a plain function, not a bound method.
+        def process_wrapper(classifications):
+            self._process_results(classifications)
+
+        self.classifier.on_detect_all(process_wrapper)
+        print("[Currency] Detector ready. Callback registered.")
+
+    def start(self, callback=None):
+        if self.is_running:
+            print("[Currency] Already running.")
+            return
+        self.is_running = True
+        self.callback = callback
+        self.last_label = None
+        self.detection_start_time = None
+        print("[Currency] Detection started. Hold note in front of camera.")
+
+    def stop(self):
+        self.is_running = False
+        self.last_label = None
+        self.detection_start_time = None
+        print("[Currency] Detection stopped.")
+
+    def _process_results(self, classifications: dict):
+        """Called by the brick on every frame (via wrapper)."""
+        if not self.is_running:
+            return
+
+        if not classifications:
+            self.last_label = None
+            self.detection_start_time = None
+            return
+
+        # Find best label
+        best_label = None
+        best_confidence = 0
+        for label, confidence in classifications.items():
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_label = label
+
+        # Debug print
+        print(f"[Currency] All: {classifications}")
+
+        if best_confidence < self.confidence_threshold:
+            self.last_label = None
+            self.detection_start_time = None
+            return
+
+        now = time.time()
+
+        if best_label == self.last_label:
+            if self.detection_start_time is None:
+                self.detection_start_time = now
+                print(f"[Currency] First detection: {best_label} ({best_confidence:.2f})")
+            elif now - self.detection_start_time >= self.detection_duration:
+                print(f"[Currency] CONFIRMED: {best_label} (held for {now - self.detection_start_time:.1f}s)")
+                self.is_running = False
+                self.last_label = None
+                self.detection_start_time = None
+                if self.callback:
+                    self.callback(best_label)
+        else:
+            self.last_label = best_label
+            self.detection_start_time = now
+            print(f"[Currency] New label: {best_label} ({best_confidence:.2f})")
+            
 # ========== Currency Detector ==========
-currency_detector = CurrencyDetector(confidence_threshold=0.5)
+currency_detector = CurrencyDetector(confidence_threshold=0.70)
 
 def on_currency_detected(label):
     """Called when currency is confirmed."""
@@ -225,14 +309,14 @@ def on_sos(state):
 def handle_voice_result(text):
     """Called when Vosk successfully recognizes speech."""
     print(f"[Voice Result] {text}")
-    ui.send_message("voice_command", text)
+    #ui.send_message("voice_command", text)
 
     # ---- Currency Detection ----
-    if "detect money" in text.lower() or "identify money" in text.lower():
+    if "detect money." in text.lower() or "identify money" in text.lower():
         print("[Voice] Starting currency detection...")
         currency_detector.start(callback=on_currency_detected)
         return
-
+    print(f"[Voice] Command not recognized: {text}")
     # ---- Navigation ----
     # if "start" in text.lower():
     #     print("Nav starting")
@@ -267,102 +351,6 @@ def on_mul(state):
 Bridge.provide("SOS", on_sos)
 Bridge.provide("Mul_Pur", on_mul)
 
-# ============================================================
-# Currency Detection
-# ============================================================
-class CurrencyDetector:
-    def __init__(self, confidence_threshold=0.5):
-        self.classifier = VideoImageClassification(confidence=confidence_threshold, debounce_sec=0.0)
-        self.confidence_threshold = confidence_threshold
-        self.is_running = False
-        self.last_label = None
-        self.detection_start_time = None
-        self.detection_duration = 2.0  # seconds
-        self.callback = None
-
-    def start(self, callback=None):
-        """Start currency detection in background thread."""
-        if self.is_running:
-            print("[Currency] Already running.")
-            return
-        self.is_running = True
-        self.callback = callback
-        self.last_label = None
-        self.detection_start_time = None
-        thread = threading.Thread(target=self._detection_loop, daemon=True)
-        thread.start()
-        print("[Currency] Detection started.")
-
-    def stop(self):
-        """Stop currency detection."""
-        self.is_running = False
-        print("[Currency] Detection stopped.")
-
-    def _detection_loop(self):
-        """Continuous detection loop."""
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            print("[Currency] ERROR: Camera not found.")
-            self.is_running = False
-            return
-
-        try:
-            while self.is_running:
-                ret, frame = cap.read()
-                if not ret:
-                    continue
-
-                # Preprocess: resize to 224x224, convert BGR to RGB
-                resized = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_LINEAR)
-                rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-
-                # Classify
-                results = self.classifier.classify(rgb)
-                self._process_results(results)
-
-                time.sleep(0.05)  # 20 FPS
-
-        except Exception as e:
-            print(f"[Currency] Error: {e}")
-        finally:
-            cap.release()
-            self.is_running = False
-            print("[Currency] Detection loop ended.")
-
-    def _process_results(self, results):
-        """Process classification results."""
-        if not results:
-            self.last_label = None
-            self.detection_start_time = None
-            return
-
-        # Get best label
-        best = max(results.items(), key=lambda x: x[1])
-        label, confidence = best
-
-        if confidence < self.confidence_threshold:
-            self.last_label = None
-            self.detection_start_time = None
-            return
-
-        now = time.time()
-
-        if label == self.last_label:
-            # Same label detected
-            if self.detection_start_time is None:
-                self.detection_start_time = now
-            elif now - self.detection_start_time >= self.detection_duration:
-                # Confirmed for 2 seconds!
-                print(f"[Currency] CONFIRMED: {label}")
-                self.is_running = False
-                if self.callback:
-                    self.callback(label)
-        else:
-            # Different label – reset
-            self.last_label = label
-            self.detection_start_time = now
-            print(f"[Currency] Detected: {label} ({confidence:.2f})")
-            
 # ========== Main entry point ==========
 def main():
     print("=" * 50)
