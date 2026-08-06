@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Voice Recognition Module using Faster Whisper (tiny) with WebRTC VAD.
-Includes fuzzy matching to map misrecognized place names.
+Includes resampling to 16 kHz.
 """
 
 import os
@@ -9,39 +9,48 @@ import json
 import queue
 import threading
 import time
-import difflib
 import sounddevice as sd
 import numpy as np
 import webrtcvad
 from faster_whisper import WhisperModel
 
+# Try to import scipy for high-quality resampling
+try:
+    from scipy import signal
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    print("[VoiceRecognition] scipy not available – using numpy interpolation for resampling.")
+
 class VoiceRecognition:
     def __init__(self, model_name="tiny", device="cpu", compute_type="int8",
                  sample_rate=16000, block_duration_ms=30,
-                 silence_timeout=1.5, vad_mode=1):
+                 silence_timeout=1.5, vad_mode=1,
+                 audio_device="AB13X USB Audio"):
         """
         Initialize the Faster Whisper recognizer with WebRTC VAD.
 
-        :param model_name: Whisper model size ("tiny", "base", "small", etc.)
-        :param device: "cpu" or "cuda"
-        :param compute_type: "int8", "float16", "float32"
-        :param sample_rate: Audio sample rate (must be 16kHz)
-        :param block_duration_ms: VAD block size (10, 20, or 30ms)
-        :param silence_timeout: Seconds of silence before auto‑stop
-        :param vad_mode: WebRTC VAD aggressiveness (0=least, 3=most)
+        :param audio_device: Name or index of the audio input device.
+        :param sample_rate: Target sample rate for Whisper (always 16 kHz).
         """
         self.model_name = model_name
         self.device = device
         self.compute_type = compute_type
-        self.sample_rate = sample_rate
-        self.sample_duration_ms = block_duration_ms
+        self.target_sample_rate = sample_rate  # Whisper expects 16 kHz
+        self.audio_device = audio_device
+        self.block_duration_ms = block_duration_ms
         self.silence_timeout = silence_timeout
         self.vad_mode = vad_mode
 
-        # VAD requires specific block sizes
-        self.block_size = int(sample_rate * block_duration_ms / 1000)
+        # ---- Determine the device's native sample rate ----
+        self.capture_sample_rate = self._get_device_sample_rate(audio_device)
+        print(f"[VoiceRecognition] Using device sample rate: {self.capture_sample_rate} Hz")
+
+        # VAD requires specific block sizes (10, 20, or 30 ms at capture rate)
+        self.block_size = int(self.capture_sample_rate * block_duration_ms / 1000)
         if self.block_size not in [160, 320, 480]:
-            raise ValueError(f"Invalid block size: {self.block_size}. Must be 160, 320, or 480 samples.")
+            # If block size doesn't match VAD requirements, adjust to 30 ms
+            self.block_size = int(self.capture_sample_rate * 30 / 1000)
 
         self._model = None
         self._vad = None
@@ -51,16 +60,42 @@ class VoiceRecognition:
         self._result_callback = None
         self._stop_requested = False
 
-        # ---------- Fuzzy Matching ----------
-        # self._place_list = []
-        # self._fuzzy_threshold = 0.6
-
         self._load_model()
         self._init_vad()
-        # self._set_default_places()
+
+    def _get_device_sample_rate(self, device):
+        """Get the default sample rate of the audio device."""
+        try:
+            dev_info = sd.query_devices(device)
+            # Most devices have a default_samplerate field
+            if 'default_samplerate' in dev_info and dev_info['default_samplerate'] > 0:
+                return int(dev_info['default_samplerate'])
+            # Fallback: try 48000 (common for USB audio)
+            return 48000
+        except Exception as e:
+            print(f"[VoiceRecognition] Could not query device: {e}. Using 48000 Hz.")
+            return 48000
+
+    def _resample(self, audio, orig_sr, target_sr):
+        """Resample audio from orig_sr to target_sr."""
+        if orig_sr == target_sr:
+            return audio
+        if SCIPY_AVAILABLE:
+            # High-quality resampling with scipy
+            number_of_samples = int(round(len(audio) * target_sr / orig_sr))
+            resampled = signal.resample(audio, number_of_samples)
+            return resampled.astype(np.float32)
+        else:
+            # Simple linear interpolation using numpy
+            import numpy as np
+            duration = len(audio) / orig_sr
+            new_length = int(duration * target_sr)
+            x_old = np.linspace(0, len(audio), len(audio))
+            x_new = np.linspace(0, len(audio), new_length)
+            resampled = np.interp(x_new, x_old, audio)
+            return resampled.astype(np.float32)
 
     def _load_model(self):
-        """Load Faster Whisper model."""
         try:
             self._model = WhisperModel(self.model_name, device=self.device, compute_type=self.compute_type)
             print(f"[VoiceRecognition] Faster Whisper '{self.model_name}' model loaded.")
@@ -71,50 +106,32 @@ class VoiceRecognition:
         self._vad = webrtcvad.Vad(self.vad_mode)
         print(f"[VoiceRecognition] WebRTC VAD initialized (aggressiveness={self.vad_mode})")
 
-    # def _set_default_places(self):
-    #     """Set default place names for fuzzy matching."""
-    #     self._place_list = [
-    #         "mangalore", "kinnigoli", "udupi", "bengaluru", "mysore",
-    #         "mumbai", "delhi", "goa", "kochi", "chennai", "hyderabad",
-    #         "pune", "ahmedabad", "jaipur", "lucknow", "patna", "bhopal",
-    #         "nagpur", "surat", "vadodara", "indore", "raipur", "ranchi",
-    #         "bhubaneswar", "guwahati", "chandigarh"
-    #     ]
-    #     print(f"[VoiceRecognition] Default place list set with {len(self._place_list)} names.")
-
-    # def set_place_list(self, place_names, threshold=0.6):
-    #     self._place_list = [p.lower() for p in place_names]
-    #     self._fuzzy_threshold = threshold
-    #     print(f"[VoiceRecognition] Place list updated with {len(self._place_list)} names.")
-
-    # def _fuzzy_match_place(self, text):
-    #     if not self._place_list or not text:
-    #         return text
-    #     text_lower = text.lower()
-    #     words = text_lower.split()
-    #     best_match = None
-    #     best_score = 0.0
-    #     for word in words:
-    #         if len(word) < 3:
-    #             continue
-    #         for place in self._place_list:
-    #             score = difflib.SequenceMatcher(None, word, place).ratio()
-    #             if score > best_score:
-    #                 best_score = score
-    #                 best_match = place
-    #     if best_match and best_score >= self._fuzzy_threshold:
-    #         return best_match.title()
-    #     return text
-
     def _audio_callback(self, indata, frames, time, status):
         if self._is_recording:
             self._audio_queue.put(indata.copy())
 
     def _is_speech(self, audio_chunk):
         try:
-            audio_int16 = (audio_chunk * 32767).astype(np.int16)
-            audio_bytes = audio_int16.tobytes()
-            return self._vad.is_speech(audio_bytes, self.sample_rate)
+            # VAD expects 16-bit PCM at 16kHz, but we're capturing at device rate.
+            # We need to resample the chunk to 16kHz for VAD.
+            # For performance, we can downsample to 16kHz only for VAD.
+            # But VAD is frame-based; we'll downsample each chunk.
+            # However, we're using VAD on the captured frames; we should resample the chunk.
+            # This is a bit of a shortcut: we'll assume the chunk is at capture_sample_rate,
+            # resample it to 16kHz for VAD, and then also keep the original for transcription.
+            # But we can also just use VAD on the original rate? Actually webrtcvad expects 16kHz.
+            # So we need to resample the chunk to 16kHz.
+            if self.capture_sample_rate != 16000:
+                # Resample to 16kHz for VAD
+                chunk_float = audio_chunk.astype(np.float32)
+                resampled_float = self._resample(chunk_float.flatten(), self.capture_sample_rate, 16000)
+                # Convert to int16
+                audio_int16 = (resampled_float * 32767).astype(np.int16)
+                audio_bytes = audio_int16.tobytes()
+            else:
+                audio_int16 = (audio_chunk * 32767).astype(np.int16)
+                audio_bytes = audio_int16.tobytes()
+            return self._vad.is_speech(audio_bytes, 16000)
         except Exception as e:
             print(f"[VoiceRecognition] VAD error: {e}")
             return False
@@ -124,12 +141,12 @@ class VoiceRecognition:
         self._is_recording = True
 
         silence_duration = 0.0
-        frame_duration = self.block_size / self.sample_rate
-        audio_buffer = bytearray()  # accumulate all audio
+        frame_duration = self.block_size / self.capture_sample_rate
+        audio_buffer = bytearray()
 
-        with sd.InputStream(samplerate=self.sample_rate,
+        with sd.InputStream(samplerate=self.capture_sample_rate,
                             blocksize=self.block_size,
-                            device=None,
+                            device=self.audio_device,
                             dtype='float32',
                             channels=1,
                             callback=self._audio_callback):
@@ -156,7 +173,6 @@ class VoiceRecognition:
                         self._is_recording = False
                         break
 
-        # After recording stops, transcribe the accumulated audio
         if len(audio_buffer) > 0:
             self._transcribe_audio(audio_buffer)
         else:
@@ -165,27 +181,25 @@ class VoiceRecognition:
         print("[VoiceRecognition] Recording stopped.")
 
     def _transcribe_audio(self, audio_buffer_bytes):
-        """Convert bytes to float32 array and run Faster Whisper transcription."""
         try:
-            # Convert bytes to int16 numpy array
+            # Convert bytes to int16 numpy array (at capture_sample_rate)
             audio_int16 = np.frombuffer(audio_buffer_bytes, dtype=np.int16)
             # Convert to float32 normalized to [-1, 1]
             audio_float32 = audio_int16.astype(np.float32) / 32768.0
 
-            # Transcribe with Faster Whisper
-            segments, info = self._model.transcribe(audio_float32, language="en", beam_size=5)
+            # Resample to 16kHz for Whisper
+            if self.capture_sample_rate != self.target_sample_rate:
+                print(f"[VoiceRecognition] Resampling from {self.capture_sample_rate} Hz to {self.target_sample_rate} Hz")
+                audio_float32 = self._resample(audio_float32, self.capture_sample_rate, self.target_sample_rate)
 
-            # Combine all segments into one text
+            segments, info = self._model.transcribe(audio_float32, language="en", beam_size=5)
             full_text = "".join([seg.text for seg in segments]).strip()
 
             if full_text:
-                # Apply fuzzy matching
-                # matched_text = self._fuzzy_match_place(full_text)
-                # if matched_text != full_text:
-                #     print(f"[VoiceRecognition] Fuzzy matched: '{full_text}' → '{matched_text}'")
-                print(f"[VoiceRecognition] Recognized: {full_text}")
-                # if self._result_callback:
-                #     self._result_callback(matched_text)
+                if self._result_callback:
+                    self._result_callback(full_text)
+                else:
+                    print("[VoiceRecognition] WARNING: No callback set!")
             else:
                 print("[VoiceRecognition] No speech recognized.")
         except Exception as e:
@@ -198,7 +212,6 @@ class VoiceRecognition:
 
         self._result_callback = callback
         self._stop_requested = False
-        # Clear the queue
         while not self._audio_queue.empty():
             try:
                 self._audio_queue.get_nowait()
@@ -209,7 +222,6 @@ class VoiceRecognition:
         self._recording_thread.start()
 
     def stop_recording(self):
-        """Manually stop recording (e.g., on long button press)."""
         if threading.current_thread() == self._recording_thread:
             self._is_recording = False
             self._stop_requested = True

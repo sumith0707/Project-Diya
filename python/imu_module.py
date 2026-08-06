@@ -38,7 +38,7 @@ class IMUReader:
         try:
             # You'll need to add Bridge.provide("get_accel") in sketch.ino
             accel = Bridge.call("get_accel")
-            print(f"[IMU Debug] Raw accel string: {accel}")
+            #print(f"[IMU Debug] Raw accel string: {accel}")
             return tuple(float(x) for x in accel.split(','))
         except Exception as e:
             print(f"[IMU] Error reading accelerometer: {e}")
