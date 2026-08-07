@@ -5,7 +5,9 @@ import threading
 import json
 import cv2
 import numpy as np
-
+import sounddevice as sd
+#print(sd.query_devices())
+#print("Default input device:", sd.default.device[0])
 # ========== Configuration ==========
 BOARD_IP = "192.168.0.105"   # CHANGE to your board's actual IP
 os.environ["ARDUINO_BOARD_IP"] = BOARD_IP
@@ -17,6 +19,27 @@ from osm_nav import OsmNavigationEngine
 from emergency_manager import EmergencyManager
 from voice_recognition import VoiceRecognition
 from imu_module import IMUReader
+from tts_manager import TTSManager
+
+# ========== TTS Setup ==========
+# Use absolute paths for reliability
+BASE_DIR = "/app"  # Or use: os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+piper_bin = os.path.join(BASE_DIR, "piper", "piper")
+model_path = os.path.join(BASE_DIR, "piper_voices", "en_US-lessac-medium.onnx")
+
+try:
+    tts = TTSManager(piper_bin=piper_bin, model_path=model_path, audio_device="plughw:1,0")
+    print("TTS ready (Piper).")
+except Exception as e:
+    print(f"TTS initialization failed: {e}")
+    tts = None
+
+# from llm_manager import LLMManager
+
+# # ========== LLM Setup ==========
+# llm_manager = LLMManager()
+# print("LLM Manager ready.")
+
 
 sos_timer = None          # Timer object for delayed SOS
 sos_active = False        # True while waiting for SOS confirmation
@@ -27,6 +50,11 @@ ui = WebUI()
 # Hardcoded destination name string (e.g., "Majestic, Bengaluru")
 DESTINATION_NAME = "Mangalore" 
 nav_engine = OsmNavigationEngine(destination_name=DESTINATION_NAME)
+
+# ---- Attach LLM to Navigation Engine ----
+# nav_engine.set_llm_manager(llm_manager)
+# print("[Main] LLM attached to navigation engine.")
+
 # ========== IMU Setup ==========
 try:
     imu = IMUReader()
@@ -65,7 +93,17 @@ try:
 except Exception as e:
     print(f"Failed to initialize Faster Whisper: {e}")
     voice = None
-    
+
+def speak(text):
+    """Helper to speak text via TTS."""
+    if tts is None:
+        print(f"[TTS] Not available: {text}")
+        return
+    tts.speak_async(text)
+    print(f"[TTS] Speaking: {text}")
+
+speak("Helloe world")
+
 # # ========== WebSocket handler for raw text ==========
 def on_raw_text(sid, message):
     print(f"\n[Raw Text] Client {sid} sent: {message}")
@@ -203,10 +241,15 @@ class CurrencyDetector:
 currency_detector = CurrencyDetector(confidence_threshold=0.70)
 
 def on_currency_detected(label):
-    """Called when currency is confirmed."""
     print(f"[Currency] CONFIRMED: {label}")
-    # Optional: Send to WebUI
-    # ui.send_message("currency", {"label": label})
+    speak(f"This is a {label} note")
+
+    # ---- Send to LLM for natural response ----
+    # actions = llm_manager.process_currency_detection(label, confidence=0.85)
+
+    # if actions.get("speak"):
+    #     ui.send_message("tts", actions["speak"])
+    #     print(f"[LLM] Speaking: {actions['speak']}")
 
 # ========== Register handlers ==========
 ui.on_message("raw_text", on_raw_text)
@@ -307,24 +350,39 @@ def on_sos(state):
         emergency.cancel_emergency()
 
 def handle_voice_result(text):
-    """Called when Vosk successfully recognizes speech."""
     print(f"[Voice Result] {text}")
-    #ui.send_message("voice_command", text)
-
-    # ---- Currency Detection ----
-    if "detect money." in text.lower() or "identify money" in text.lower():
-        print("[Voice] Starting currency detection...")
+    # ---- Currency detection ----
+    if "detect money" in text.lower() or "identify money" in text.lower():
+        print("Starting currency detection...")
         currency_detector.start(callback=on_currency_detected)
         return
-    print(f"[Voice] Command not recognized: {text}")
-    # ---- Navigation ----
-    # if "start" in text.lower():
-    #     print("Nav starting")
-    #     nav_engine.update_live_gps(lat2, lng2)
-    #     return
 
-    # # ---- Other commands ----
-    # print(f"[Voice] Command not recognized: {text}")
+    # ---- Unknown command ----
+    speak("I didn't understand that command.")
+
+    # ---- Process voice command through LLM ----
+    # actions = llm_manager.process_voice_command(text)
+
+    # # ---- Execute actions ----
+    # if actions.get("speak"):
+    #     ui.send_message("tts", actions["speak"])
+    #     print(f"[LLM] Speaking: {actions['speak']}")
+
+    # if actions.get("action") == "currency":
+    #     print("[LLM] Starting currency detection...")
+    #     currency_detector.start(callback=on_currency_detected)
+
+    # if actions.get("action") == "navigate":
+    #     destination = actions.get("destination")
+    #     if destination:
+    #         nav_engine.destination_name = destination
+    #         nav_engine._resolve_destination_coords()
+    #         nav_engine.update_live_gps(lat2, lng2)
+    #         ui.send_message("tts", f"Navigating to {destination}")
+    #         print(f"[LLM] Navigating to {destination}")
+
+    # if actions.get("action") == "reroute":
+    #     nav_engine.reroute()
 
 def on_mul(state):
     print(f"[Mul_Pur] Button pressed: {state}")
