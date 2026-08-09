@@ -6,15 +6,15 @@ import json
 import cv2
 import numpy as np
 import sounddevice as sd
-#print(sd.query_devices())
-#print("Default input device:", sd.default.device[0])
+
 # ========== Configuration ==========
-BOARD_IP = "192.168.0.105"   # CHANGE to your board's actual IP
+BOARD_IP = "192.168.0.105"
 os.environ["ARDUINO_BOARD_IP"] = BOARD_IP
 
 from arduino.app_utils import Bridge, App
 from arduino.app_bricks.web_ui import WebUI
 from arduino.app_bricks.video_imageclassification import VideoImageClassification
+from arduino.app_bricks.video_objectdetection import VideoObjectDetection
 from osm_nav import OsmNavigationEngine
 from emergency_manager import EmergencyManager
 from voice_recognition import VoiceRecognition
@@ -22,8 +22,7 @@ from imu_module import IMUReader
 from tts_manager import TTSManager
 
 # ========== TTS Setup ==========
-# Use absolute paths for reliability
-BASE_DIR = "/app"  # Or use: os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = "/app"
 piper_bin = os.path.join(BASE_DIR, "piper", "piper")
 model_path = os.path.join(BASE_DIR, "piper_voices", "en_US-lessac-medium.onnx")
 
@@ -34,26 +33,19 @@ except Exception as e:
     print(f"TTS initialization failed: {e}")
     tts = None
 
-# from llm_manager import LLMManager
-
-# # ========== LLM Setup ==========
-# llm_manager = LLMManager()
-# print("LLM Manager ready.")
-
-
-sos_timer = None          # Timer object for delayed SOS
-sos_active = False        # True while waiting for SOS confirmation
+def speak(text):
+    if tts is None:
+        print(f"[TTS] Not available: {text}")
+        return
+    tts.speak_async(text)
+    print(f"[TTS] Speaking: {text}")
 
 # ========== WebUI instance ==========
 ui = WebUI()
 
-# Hardcoded destination name string (e.g., "Majestic, Bengaluru")
-DESTINATION_NAME = "Mangalore" 
+# ========== Navigation Engine ==========
+DESTINATION_NAME = "Mangalore"
 nav_engine = OsmNavigationEngine(destination_name=DESTINATION_NAME)
-
-# ---- Attach LLM to Navigation Engine ----
-# nav_engine.set_llm_manager(llm_manager)
-# print("[Main] LLM attached to navigation engine.")
 
 # ========== IMU Setup ==========
 try:
@@ -65,26 +57,22 @@ except Exception as e:
     nav_engine.set_imu(None)
 
 # ========== Emergency Manager ==========
-emergency = EmergencyManager(imu=imu)  # Pass IMU for fall detection
-emergency.set_ui(ui)                    # Set UI for sending messages
-emergency.start_fall_detection()        # Start fall detection thread
+emergency = EmergencyManager(imu=imu)
+emergency.set_ui(ui)
+emergency.start_fall_detection()
 
-# ========== Shared GPS data (for future use) ==========
-gps_data = {
-    "lat": 0.0,
-    "lng": 0.0,
-    "fix": False,
-    "last_update": 0.0
-}
+# ========== Shared GPS data ==========
+gps_data = {"lat": 0.0, "lng": 0.0, "fix": False, "last_update": 0.0}
 gps_lock = threading.Lock()
+lat2 = 0.0
+lng2 = 0.0
 
 # ========== Voice Recognition Setup ==========
-
 try:
     voice = VoiceRecognition(
-        model_name="tiny",      # Use tiny model
+        model_name="tiny",
         device="cpu",
-        compute_type="int8",    # Optimized for CPU
+        compute_type="int8",
         block_duration_ms=30,
         silence_timeout=1.5,
         vad_mode=1
@@ -94,70 +82,223 @@ except Exception as e:
     print(f"Failed to initialize Faster Whisper: {e}")
     voice = None
 
-def speak(text):
-    """Helper to speak text via TTS."""
-    if tts is None:
-        print(f"[TTS] Not available: {text}")
-        return
-    tts.speak_async(text)
-    print(f"[TTS] Speaking: {text}")
+# ============================================================
+# OBJECT DETECTION MANAGER (Merged from test app)
+# ============================================================
+class ObjectDetectionManager:
+    def __init__(self, ui):
+        self.ui = ui
+        self.detection_stream = VideoObjectDetection(confidence=0.2, debounce_sec=0.0)
 
-speak("Helloe world")
+        # ---- Frame & Servo Boundaries ----
+        self.FRAME_WIDTH = 640
+        self.FRAME_HEIGHT = 480
+        self.FRAME_CENTER_X = 320
+        self.FRAME_CENTER_Y = 240
 
-# # ========== WebSocket handler for raw text ==========
-def on_raw_text(sid, message):
-    print(f"\n[Raw Text] Client {sid} sent: {message}")
-    ui.send_message("reply", f"UNO Q received: {message}", sid)
-    if message == "start":
-        print("Nav starting")
-        nav_engine.update_live_gps(lat2, lng2)
-        print("Nav started")
+        self.PAN_MIN = 20
+        self.PAN_MAX = 160
+        self.TILT_MIN = 20
+        self.TILT_MAX = 160
 
-# ========== WebSocket handler for GPS data ==========
-def on_gps(sid, message):
-    """
-    Expects a JSON string: {"lat": 12.345, "lng": 67.890}
-    """
-    global lat2, lng2
-    try:
-        # If message is a string, parse it as JSON
-        if isinstance(message, str):
-            data = json.loads(message)
+        self.DEAD_ZONE_X = 25
+        self.DEAD_ZONE_Y = 25
+        self.KP_PAN = 0.04
+        self.KP_TILT = 0.04
+
+        self.current_pan_angle = 90.0
+        self.current_tilt_angle = 90.0
+        self.tracking_enabled = True
+        self.last_detection_time = time.time()
+        self.DETECTION_TIMEOUT = 7.0
+        self.RECENTER_EASE = 0.1
+
+        # ---- Object Lock ----
+        self.LOCK_DURATION = 5.0
+        self.locked_label = None
+        self.lock_start_time = 0.0
+
+        # ---- Threading ----
+        self.latest_center = None
+        self.has_new_target = False
+        self.target_lock = threading.Lock()
+        self.servo_thread = None
+        self.is_running = False
+        self.is_paused = False  # Paused for currency detection
+
+        # ---- Register WebUI handlers ----
+        self.ui.on_message("override_th", self._on_override_threshold)
+        self.ui.on_message("toggle_tracking", self._on_toggle_tracking)
+
+    def _on_override_threshold(self, sid, threshold):
+        self.detection_stream.override_threshold(float(threshold))
+
+    def _on_toggle_tracking(self, sid, state):
+        self.tracking_enabled = (state == "on")
+        print(f"[ObjDetect] Tracking {'enabled' if self.tracking_enabled else 'disabled'}.")
+        if not self.tracking_enabled:
+            self.locked_label = None
+            self.current_pan_angle = 90.0
+            self.current_tilt_angle = 90.0
+            self._set_servo_target(90, 90)
+
+    def _set_servo_target(self, pan, tilt):
+        pan = max(self.PAN_MIN, min(self.PAN_MAX, int(pan)))
+        tilt = max(self.TILT_MIN, min(self.TILT_MAX, int(tilt)))
+        try:
+            Bridge.notify("servo", f"{pan},{tilt}")
+        except Exception as e:
+            print(f"[ObjDetect] Servo error: {e}")
+
+    def _servo_control_loop(self):
+        while self.is_running:
+            if not self.is_paused:
+                with self.target_lock:
+                    center = self.latest_center
+                    new_target = self.has_new_target
+                    self.has_new_target = False
+
+                if self.tracking_enabled and new_target and center is not None:
+                    cx, cy = center
+                    error_x = cx - self.FRAME_CENTER_X
+                    error_y = cy - self.FRAME_CENTER_Y
+
+                    if abs(error_x) < self.DEAD_ZONE_X:
+                        error_x = 0
+                    if abs(error_y) < self.DEAD_ZONE_Y:
+                        error_y = 0
+
+                    self.current_pan_angle -= error_x * self.KP_PAN
+                    self.current_tilt_angle -= error_y * self.KP_TILT
+
+                    self.current_pan_angle = max(self.PAN_MIN, min(self.PAN_MAX, self.current_pan_angle))
+                    self.current_tilt_angle = max(self.TILT_MIN, min(self.TILT_MAX, self.current_tilt_angle))
+
+                    self.last_detection_time = time.time()
+                    self._set_servo_target(self.current_pan_angle, self.current_tilt_angle)
+
+                else:
+                    time_since_detection = time.time() - self.last_detection_time
+                    if self.tracking_enabled and time_since_detection > self.DETECTION_TIMEOUT:
+                        pan_diff = 90.0 - self.current_pan_angle
+                        tilt_diff = 90.0 - self.current_tilt_angle
+                        if abs(pan_diff) > 0.5 or abs(tilt_diff) > 0.5:
+                            self.current_pan_angle += pan_diff * self.RECENTER_EASE
+                            self.current_tilt_angle += tilt_diff * self.RECENTER_EASE
+                            self._set_servo_target(self.current_pan_angle, self.current_tilt_angle)
+                        elif self.current_pan_angle != 90.0 or self.current_tilt_angle != 90.0:
+                            self.current_pan_angle = 90.0
+                            self.current_tilt_angle = 90.0
+                            self._set_servo_target(90, 90)
+
+            time.sleep(0.033)
+
+    def _detection_callback(self, detections: dict):
+        """Called by the detection brick on every frame."""
+        best_center = None
+        now = time.time()
+
+        # Forward to WebUI
+        if detections:
+            for key, values in detections.items():
+                for value in values:
+                    entry = {
+                        "content": key,
+                        "confidence": value.get("confidence"),
+                        "timestamp": datetime.now(UTC).isoformat()
+                    }
+                    self.ui.send_message("detection", message=entry)
+
+        # ---- Don't process if paused ----
+        if self.is_paused:
+            return
+
+        # ---- Target Selection with Lock ----
+        lock_active = (self.locked_label is not None) and ((now - self.lock_start_time) < self.LOCK_DURATION)
+
+        if lock_active:
+            if detections and self.locked_label in detections:
+                best_dist = float('inf')
+                for det in detections[self.locked_label]:
+                    bbox = det.get("bounding_box_xyxy", [0, 0, 0, 0])
+                    if bbox != [0, 0, 0, 0] and len(bbox) >= 4:
+                        x1, y1, x2, y2 = bbox
+                        cx = (x1 + x2) / 2.0
+                        cy = (y1 + y2) / 2.0
+                        dist = ((cx - self.FRAME_CENTER_X) ** 2 + (cy - self.FRAME_CENTER_Y) ** 2) ** 0.5
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_center = (cx, cy)
         else:
-            data = message
+            if detections:
+                highest_conf = -1.0
+                selected_label = None
+                selected_center = None
 
-        lat = float(data.get("lat", 0))
-        lng = float(data.get("lng", 0))
+                for label, values in detections.items():
+                    for det in values:
+                        conf = det.get("confidence", 0.0) or 0.0
+                        bbox = det.get("bounding_box_xyxy", [0, 0, 0, 0])
+                        if bbox != [0, 0, 0, 0] and len(bbox) >= 4:
+                            if conf > highest_conf:
+                                highest_conf = conf
+                                selected_label = label
+                                x1, y1, x2, y2 = bbox
+                                selected_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
 
-        # Validate coordinates (optional)
-        # if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
-        #     print(f"\n[GPS] Invalid coordinates from {sid}: lat={lat}, lng={lng}")
-        #     return
+                if selected_label is not None:
+                    self.locked_label = selected_label
+                    self.lock_start_time = now
+                    best_center = selected_center
+                    print(f"[ObjDetect] Locked onto '{selected_label}' (Conf: {highest_conf:.2f})")
+            else:
+                self.locked_label = None
 
-        with gps_lock:
-            gps_data["lat"] = lat
-            gps_data["lng"] = lng
-            gps_data["fix"] = True
-            gps_data["last_update"] = time.time()
+        with self.target_lock:
+            if best_center is not None:
+                self.latest_center = best_center
+                self.has_new_target = True
 
-        
+    def start(self):
+        if self.is_running:
+            return
+        self.is_running = True
+        self.is_paused = False
 
-        print(f"\n[GPS] {sid} -> Lat: {lat:.6f}, Lng: {lng:.6f}")
-        lat2=lat
-        lng2=lng
-        # Optional: send acknowledgment
-        # ui.send_message("gps_ack", {"status": "ok", "lat": lat, "lng": lng}, sid)
+        # Register detection callback
+        self.detection_stream.on_detect_all(self._detection_callback)
 
-    except json.JSONDecodeError:
-        print(f"\n[GPS] Invalid JSON from {sid}: {message}")
-    except Exception as e:
-        print(f"\n[GPS] Error: {e}")
+        # Start servo thread
+        self.servo_thread = threading.Thread(target=self._servo_control_loop, daemon=True)
+        self.servo_thread.start()
+
+        print("[ObjDetect] Started.")
+
+    def pause(self):
+        """Pause object detection (for currency detection)."""
+        self.is_paused = True
+        print("[ObjDetect] Paused.")
+
+    def resume(self):
+        """Resume object detection."""
+        self.is_paused = False
+        self.last_detection_time = time.time()
+        print("[ObjDetect] Resumed.")
+
+    def stop(self):
+        self.is_running = False
+        print("[ObjDetect] Stopped.")
+
+    def get_status(self):
+        return {
+            "running": self.is_running,
+            "paused": self.is_paused,
+            "tracking": self.tracking_enabled,
+            "locked_label": self.locked_label
+        }
 
 # ============================================================
 # Currency Detection
-# ============================================================
-# ============================================================
-# Currency Detection (Based on Working Example)
 # ============================================================
 class CurrencyDetector:
     def __init__(self, confidence_threshold=0.5):
@@ -168,19 +309,25 @@ class CurrencyDetector:
         self.detection_start_time = None
         self.detection_duration = 2.0
         self.callback = None
+        self.obj_detection_manager = None
 
-        # ---- Register the callback using a wrapper function ----
-        # The brick expects a plain function, not a bound method.
         def process_wrapper(classifications):
             self._process_results(classifications)
 
         self.classifier.on_detect_all(process_wrapper)
-        print("[Currency] Detector ready. Callback registered.")
+        print("[Currency] Detector ready.")
+
+    def set_object_detection_manager(self, manager):
+        self.obj_detection_manager = manager
 
     def start(self, callback=None):
         if self.is_running:
             print("[Currency] Already running.")
             return
+        # ---- Pause object detection ----
+        if self.obj_detection_manager:
+            self.obj_detection_manager.pause()
+
         self.is_running = True
         self.callback = callback
         self.last_label = None
@@ -191,10 +338,12 @@ class CurrencyDetector:
         self.is_running = False
         self.last_label = None
         self.detection_start_time = None
+        # ---- Resume object detection ----
+        if self.obj_detection_manager:
+            self.obj_detection_manager.resume()
         print("[Currency] Detection stopped.")
 
     def _process_results(self, classifications: dict):
-        """Called by the brick on every frame (via wrapper)."""
         if not self.is_running:
             return
 
@@ -203,16 +352,12 @@ class CurrencyDetector:
             self.detection_start_time = None
             return
 
-        # Find best label
         best_label = None
         best_confidence = 0
         for label, confidence in classifications.items():
             if confidence > best_confidence:
                 best_confidence = confidence
                 best_label = label
-
-        # Debug print
-        print(f"[Currency] All: {classifications}")
 
         if best_confidence < self.confidence_threshold:
             self.last_label = None
@@ -226,43 +371,84 @@ class CurrencyDetector:
                 self.detection_start_time = now
                 print(f"[Currency] First detection: {best_label} ({best_confidence:.2f})")
             elif now - self.detection_start_time >= self.detection_duration:
-                print(f"[Currency] CONFIRMED: {best_label} (held for {now - self.detection_start_time:.1f}s)")
+                print(f"[Currency] CONFIRMED: {best_label}")
                 self.is_running = False
                 self.last_label = None
                 self.detection_start_time = None
+                # ---- Resume object detection ----
+                if self.obj_detection_manager:
+                    self.obj_detection_manager.resume()
                 if self.callback:
                     self.callback(best_label)
         else:
             self.last_label = best_label
             self.detection_start_time = now
             print(f"[Currency] New label: {best_label} ({best_confidence:.2f})")
-            
-# ========== Currency Detector ==========
+
+# ============================================================
+# Initialize Object Detection Manager
+# ============================================================
+obj_detection = ObjectDetectionManager(ui)
+obj_detection.start()
+print("[Main] Object detection started.")
+
+# ============================================================
+# Initialize Currency Detector (with reference to object detection)
+# ============================================================
 currency_detector = CurrencyDetector(confidence_threshold=0.70)
+currency_detector.set_object_detection_manager(obj_detection)
 
 def on_currency_detected(label):
     print(f"[Currency] CONFIRMED: {label}")
     speak(f"This is a {label} note")
 
-    # ---- Send to LLM for natural response ----
-    # actions = llm_manager.process_currency_detection(label, confidence=0.85)
+# ============================================================
+# WebSocket Handlers
+# ============================================================
+def on_raw_text(sid, message):
+    print(f"\n[Raw Text] Client {sid} sent: {message}")
+    ui.send_message("reply", f"UNO Q received: {message}", sid)
+    if message == "start":
+        print("Nav starting")
+        nav_engine.update_live_gps(lat2, lng2)
+        print("Nav started")
 
-    # if actions.get("speak"):
-    #     ui.send_message("tts", actions["speak"])
-    #     print(f"[LLM] Speaking: {actions['speak']}")
+def on_gps(sid, message):
+    global lat2, lng2
+    try:
+        if isinstance(message, str):
+            data = json.loads(message)
+        else:
+            data = message
+        lat = float(data.get("lat", 0))
+        lng = float(data.get("lng", 0))
+        with gps_lock:
+            gps_data["lat"] = lat
+            gps_data["lng"] = lng
+            gps_data["fix"] = True
+            gps_data["last_update"] = time.time()
+        print(f"\n[GPS] {sid} -> Lat: {lat:.6f}, Lng: {lng:.6f}")
+        lat2 = lat
+        lng2 = lng
+    except json.JSONDecodeError:
+        print(f"\n[GPS] Invalid JSON from {sid}: {message}")
+    except Exception as e:
+        print(f"\n[GPS] Error: {e}")
 
-# ========== Register handlers ==========
+# ============================================================
+# Register WebUI Handlers
+# ============================================================
 ui.on_message("raw_text", on_raw_text)
 ui.on_message("gps", on_gps)
 
+# ============================================================
+# Ultrasonic Handler
+# ============================================================
 obstacle_data = {"left": 0, "center": 0, "right": 0}
 obstacle_lock = threading.Lock()
 
-# ========== Handler for ultrasonic notifications ==========
 def on_ultrasonic(data):
-    """Called when MCU pushes ultrasonic data via Bridge.notify()"""
     try:
-        # Data is a comma-separated string: "1,0,1"
         parts = data.split(",")
         if len(parts) == 3:
             left = int(parts[0])
@@ -272,25 +458,23 @@ def on_ultrasonic(data):
                 obstacle_data["left"] = left
                 obstacle_data["center"] = center
                 obstacle_data["right"] = right
-            # Optional: print only on change
-            # print(f"Ultrasonic: L={left}, C={center}, R={right}")
     except Exception as e:
         print(f"Ultrasonic parse error: {e}")
 
 Bridge.provide("ultrasonic", on_ultrasonic)
 
-# ========== Obstacle monitoring (runs in a background thread) ==========
+# ============================================================
+# Obstacle Monitoring Thread
+# ============================================================
 def monitor_obstacles(update_interval=0.05):
     print("Obstacle monitor running (using Bridge.notify()).")
     prev_state = (-1, -1, -1)
-
     try:
         while True:
             with obstacle_lock:
                 left = obstacle_data["left"]
                 center = obstacle_data["center"]
                 right = obstacle_data["right"]
-
             if (left, center, right) != prev_state:
                 status = ""
                 status += "L" if left else "-"
@@ -299,50 +483,13 @@ def monitor_obstacles(update_interval=0.05):
                 timestamp = time.strftime("%H:%M:%S")
                 print(f"[{timestamp}] Obstacles: [{status}]")
                 prev_state = (left, center, right)
-
             time.sleep(update_interval)
     except KeyboardInterrupt:
         print("Obstacle monitor stopped.")
 
-# def send_sos():
-#     """Called after 5 seconds if SOS is not cancelled."""
-#     global sos_active, sos_timer
-#     print("[SOS] Timer expired – sending SOS alert!")
-#     ui.send_message("sos", "SOS")   # Broadcast to all clients
-#     sos_active = False
-#     sos_timer = None
-
-# # ========== SOS Handler ==========
-# def on_sos(state):
-#     global sos_active, sos_timer
-#     print(f"[SOS] Received state: {state}")
-
-#     if state == "sos":
-#         # Short press – start timer
-#         if sos_active:
-#             # Cancel any existing timer (shouldn't happen normally)
-#             if sos_timer:
-#                 sos_timer.cancel()
-#                 sos_timer = None
-#         # Start new 5-second timer
-#         sos_active = True
-#         sos_timer = threading.Timer(5.0, send_sos)
-#         sos_timer.start()
-#         print("[SOS] Timer started – waiting 5 seconds for cancellation.")
-
-#     elif state == "sos_cancel":
-#         # Long press – cancel if timer is active
-#         if sos_active:
-#             if sos_timer:
-#                 sos_timer.cancel()
-#                 sos_timer = None
-#             sos_active = False
-#             print("[SOS] Cancelled – no alert sent.")
-#             ui.send_message("sos", "SOS_CANCELLED")   # Optional: inform UI
-#         else:
-#             # Long press without active timer – ignore
-#             print("[SOS] Long press ignored (no active SOS).")
-
+# ============================================================
+# SOS and Multi-Purpose Button Handlers
+# ============================================================
 def on_sos(state):
     if state == "sos":
         emergency.trigger_emergency(source="button")
@@ -351,6 +498,7 @@ def on_sos(state):
 
 def handle_voice_result(text):
     print(f"[Voice Result] {text}")
+
     # ---- Currency detection ----
     if "detect money" in text.lower() or "identify money" in text.lower():
         print("Starting currency detection...")
@@ -359,30 +507,6 @@ def handle_voice_result(text):
 
     # ---- Unknown command ----
     speak("I didn't understand that command.")
-
-    # ---- Process voice command through LLM ----
-    # actions = llm_manager.process_voice_command(text)
-
-    # # ---- Execute actions ----
-    # if actions.get("speak"):
-    #     ui.send_message("tts", actions["speak"])
-    #     print(f"[LLM] Speaking: {actions['speak']}")
-
-    # if actions.get("action") == "currency":
-    #     print("[LLM] Starting currency detection...")
-    #     currency_detector.start(callback=on_currency_detected)
-
-    # if actions.get("action") == "navigate":
-    #     destination = actions.get("destination")
-    #     if destination:
-    #         nav_engine.destination_name = destination
-    #         nav_engine._resolve_destination_coords()
-    #         nav_engine.update_live_gps(lat2, lng2)
-    #         ui.send_message("tts", f"Navigating to {destination}")
-    #         print(f"[LLM] Navigating to {destination}")
-
-    # if actions.get("action") == "reroute":
-    #     nav_engine.reroute()
 
 def on_mul(state):
     print(f"[Mul_Pur] Button pressed: {state}")
@@ -402,17 +526,19 @@ def on_mul(state):
     if state == "short":
         print("Starting voice recognition...")
         voice.start_recording(callback=handle_voice_result)
-    else:  # long press
+    else:
         print("Cancelling voice recognition...")
         voice.stop_recording()
-    
+
 Bridge.provide("SOS", on_sos)
 Bridge.provide("Mul_Pur", on_mul)
 
-# ========== Main entry point ==========
+# ============================================================
+# Main Entry Point
+# ============================================================
 def main():
     print("=" * 50)
-    print("Diya 2 – Obstacle Detection + Raw Text + GPS")
+    print("Diya 2 – Full System")
     print("=" * 50)
 
     obstacle_thread = threading.Thread(target=monitor_obstacles, daemon=True)

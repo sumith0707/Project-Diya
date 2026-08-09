@@ -4,17 +4,337 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Diya 2 Controller</title>
-    <!-- Load Socket.IO from a CDN so 'io' is guaranteed to be defined -->
-    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background: #1e1e2e;
+            color: white;
+        }
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+        }
+        .main-content {
+            display: flex;
+            gap: 20px;
+        }
+        .left-column {
+            flex: 2;
+        }
+        .right-column {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        .container {
+            background: #2d2d44;
+            padding: 15px;
+            border-radius: 8px;
+        }
+        .video-container {
+            position: relative;
+            width: 100%;
+            max-width: 640px;
+        }
+        #videoFeedContainer {
+            position: relative;
+            width: 100%;
+            padding-bottom: 75%;
+            background: #1a1a2e;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        #videoPlaceholder {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        #dynamicIframe {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border: none;
+        }
+        .controls-section {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .control-confidence {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .slider-box {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .slider-container {
+            flex: 1;
+            position: relative;
+        }
+        .slider-progress {
+            position: absolute;
+            height: 4px;
+            background: #4CAF50;
+            border-radius: 2px;
+            pointer-events: none;
+            top: 50%;
+            transform: translateY(-50%);
+        }
+        .confidence-value-display {
+            position: absolute;
+            top: -20px;
+            transform: translateX(-50%);
+            font-size: 12px;
+            color: #aaa;
+        }
+        input[type="range"] {
+            width: 100%;
+            -webkit-appearance: none;
+            background: #444;
+            height: 4px;
+            border-radius: 2px;
+            outline: none;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #4CAF50;
+            cursor: pointer;
+        }
+        .confidence-limits {
+            font-size: 12px;
+            color: #888;
+        }
+        #feedback-content {
+            min-height: 80px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #recentDetections {
+            list-style: none;
+            padding: 0;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        #recentDetections li {
+            padding: 5px 0;
+            border-bottom: 1px solid #444;
+            font-size: 14px;
+        }
+        .scan-container {
+            padding: 5px 0;
+            border-bottom: 1px solid #444;
+        }
+        .scan-content {
+            display: block;
+        }
+        .scan-content-time {
+            font-size: 12px;
+            color: #888;
+        }
+        .text-input-section {
+            margin-top: 15px;
+        }
+        .text-input-section input {
+            padding: 8px;
+            border-radius: 4px;
+            border: none;
+            width: 70%;
+            background: #3d3d5c;
+            color: white;
+        }
+        .text-input-section button {
+            padding: 8px 16px;
+            border-radius: 4px;
+            border: none;
+            background: #4CAF50;
+            color: white;
+            cursor: pointer;
+            margin-left: 5px;
+        }
+        .text-input-section button:hover {
+            background: #45a049;
+        }
+        #sos {
+            color: #ff4444;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+        #output {
+            color: #aaa;
+            margin-top: 5px;
+        }
+        .tracking-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .tracking-controls button {
+            padding: 5px 15px;
+            border-radius: 4px;
+            border: none;
+            cursor: pointer;
+        }
+        .tracking-controls .btn-on {
+            background: #4CAF50;
+            color: white;
+        }
+        .tracking-controls .btn-off {
+            background: #ff4444;
+            color: white;
+        }
+        .tracking-status {
+            font-weight: bold;
+        }
+        .status-on { color: #4CAF50; }
+        .status-off { color: #ff4444; }
+        .info-btn {
+            cursor: pointer;
+            width: 16px;
+            height: 16px;
+        }
+        .popover {
+            display: none;
+            position: absolute;
+            background: #444;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            max-width: 200px;
+            z-index: 10;
+        }
+    </style>
 </head>
 <body>
+    <div class="header">
+        <h1>Diya 2</h1>
+        <div class="tracking-controls">
+            <span>Tracking:</span>
+            <span id="tracking_status" class="status-on">ON</span>
+            <button onclick="toggleTracking('on')" class="btn-on">ON</button>
+            <button onclick="toggleTracking('off')" class="btn-off">OFF</button>
+        </div>
+    </div>
 
-    <input id="txt" type="text">
-    <button onclick="sendText()">Send</button>
-    <p id="output"></p>
-    <p id="sos"></p>
+    <div class="main-content">
+        <div class="left-column">
+            <div class="container video-container">
+                <div id="videoFeedContainer">
+                    <div id="videoPlaceholder" class="camera-status">
+                        <img src="./img/no-face.svg" alt="Searching webcam" />
+                        <p class="feedback-text">Searching Webcam...</p>
+                    </div>
+                    <iframe
+                        id="dynamicIframe"
+                        title="Video stream"
+                        frameborder="0"
+                        style="display: none;"></iframe>
+                </div>
+            </div>
 
-    <!-- Correct path to your local app.js -->
+            <div class="container text-input-section">
+                <input id="txt" type="text" placeholder="Type a message...">
+                <button onclick="sendText()">Send</button>
+                <p id="output"></p>
+                <p id="sos"></p>
+            </div>
+        </div>
+
+        <div class="right-column">
+            <div class="container">
+                <div class="controls-section">
+                    <div class="control-group">
+                        <div class="control-confidence">
+                            <div style="display: flex; align-items: center; gap: 8px; position: relative">
+                                <label id="confidence-label" for="confidenceSlider">Confidence</label>
+                                <img src="./img/info.svg" alt="Info" class="info-btn confidence" />
+                                <div class="popover">Minimum confidence score for detected objects.</div>
+                            </div>
+                            <button id="confidenceResetButton">
+                                <input type="number" id="confidenceInput" min="0" max="1" step="0.05" value="0.50" />
+                                <img src="img/icon-reset.svg" alt="Reset" style="width:16px;cursor:pointer;" />
+                            </button>
+                        </div>
+                        <div class="slider-box">
+                            <span class="confidence-limits">0</span>
+                            <div class="slider-container">
+                                <div class="slider-progress" id="sliderProgress"></div>
+                                <div class="confidence-value-display" id="confidenceValueDisplay">0.5</div>
+                                <input type="range" id="confidenceSlider" min="0" max="1" step="0.01" value="0.5" />
+                            </div>
+                            <span class="confidence-limits">1</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="container">
+                <div style="display: flex; align-items: center; gap: 8px; position: relative">
+                    <h2 style="margin:0;">Feedback</h2>
+                    <img src="./img/info.svg" alt="Info" class="info-btn feedback" />
+                    <div class="popover">System response will appear here.</div>
+                </div>
+                <div id="feedback-content">
+                    <img src="img/stars.svg" alt="Stars" />
+                    <p class="feedback-text">System response will appear here</p>
+                </div>
+            </div>
+
+            <div class="container">
+                <h2>Recent detections</h2>
+                <ul id="recentDetections">
+                    <li>No objects detected yet</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <div id="error-container" style="display:none;color:#ff4444;"></div>
+
+    <script>
+        const iframe = document.getElementById('dynamicIframe');
+        const placeholder = document.getElementById('videoPlaceholder');
+        const currentHostname = window.location.hostname;
+        const targetPort = 4912;
+        const targetPath = '/embed';
+        const streamUrl = `http://${currentHostname}:${targetPort}${targetPath}`;
+
+        let intervalId;
+
+        iframe.onload = () => {
+            if (intervalId) clearInterval(intervalId);
+            placeholder.style.display = 'none';
+            iframe.style.display = 'block';
+        };
+
+        const startLoading = () => { iframe.src = streamUrl; };
+        intervalId = setInterval(startLoading, 1000);
+    </script>
+
+    <script src="/socket.io/socket.io.js"></script>
     <script src="app.js"></script>
 </body>
 </html>
