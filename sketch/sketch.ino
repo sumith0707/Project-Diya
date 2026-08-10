@@ -4,7 +4,7 @@
 #include <Servo.h>
 
 // ============================================================
-// SERVO CONFIGURATION (NEW)
+// SERVO CONFIGURATION
 // ============================================================
 Servo servo_pan;
 Servo servo_tilt;
@@ -22,7 +22,6 @@ float current_tilt = 90.0;
 float target_pan = 90.0;
 float target_tilt = 90.0;
 
-// Track last written integer angles to prevent identical re-writes
 int last_written_pan = -1;
 int last_written_tilt = -1;
 
@@ -55,16 +54,37 @@ SWI2C mpu(SDA_PIN, SCL_PIN, MPU6050_ADDR);
 #define GYRO_SCALE 65.5
 
 // ============================================================
-// ULTRASONIC SENSORS
+// ULTRASONIC SENSORS – INTERRUPT DRIVEN, NON-BLOCKING
 // ============================================================
 const int trigPins[3] = {9, 7, 5};
 const int echoPins[3] = {2, 8, 6};
-long duration;
+
 const float ALPHA = 0.6;
 float filtered[3] = {-1.0, -1.0, -1.0};
 const float THRESHOLD_CM = 50.0;
-unsigned long previousMillis = 0;
-const unsigned long SEND_INTERVAL_MS = 50;
+
+const unsigned long US_TIMEOUT_US   = 30000; // 30ms max wait (~5m range)
+const unsigned long TRIGGER_HIGH_US = 10;    // trigger pulse width
+const unsigned long COOLDOWN_US     = 3000;  // gap between sensors, kill crosstalk
+
+enum UltrasonicState {
+  US_TRIG_HIGH,
+  US_TRIG_LOW,
+  US_WAIT_ECHO,
+  US_COOLDOWN
+};
+
+UltrasonicState usState = US_TRIG_HIGH;
+unsigned long usStateStart = 0;
+int currentSensor = 0;
+
+// ---- interrupt shared data ----
+volatile unsigned long echoStart[3]    = {0, 0, 0};
+volatile unsigned long echoDuration[3] = {0, 0, 0};
+volatile bool echoReady[3]             = {false, false, false};
+
+unsigned long previousNotifyMillis = 0;
+const unsigned long NOTIFY_INTERVAL_MS = 50;
 
 // ============================================================
 // BUTTONS
@@ -85,13 +105,18 @@ const unsigned long MPU_READ_INTERVAL = 100;
 // ============================================================
 // FUNCTION PROTOTYPES
 // ============================================================
-float getDistance(int trig, int echo);
 int checkObstacle(int sensor_index);
 int pingHandler();
 float getIMUHeading();
 String getAccelerometer();
 bool initMPU6050();
 void readMPU6050();
+void initUltrasonic();
+void processUltrasonic();
+void sendUltrasonicData();
+void echoISR0();
+void echoISR1();
+void echoISR2();
 
 // ============================================================
 // SETUP
@@ -100,12 +125,8 @@ void setup() {
   Bridge.begin();
   Serial.begin(9600);
 
-  // ---- Ultrasonic pins ----
-  for (int i = 0; i < 3; i++) {
-    pinMode(trigPins[i], OUTPUT);
-    pinMode(echoPins[i], INPUT);
-    digitalWrite(trigPins[i], LOW);
-  }
+  // ---- Ultrasonic ----
+  initUltrasonic();
 
   // ---- Buttons ----
   button.attachClick(shortClick);
@@ -122,7 +143,7 @@ void setup() {
     Serial.println("MPU6050 not found!");
   }
 
-  // ---- Servos (NEW) ----
+  // ---- Servos ----
   servo_pan.attach(PAN_PIN);
   servo_tilt.attach(TILT_PIN);
   servo_pan.write(90);
@@ -138,9 +159,9 @@ void setup() {
   Bridge.provide("ping", pingHandler);
   Bridge.provide("get_heading", getIMUHeading);
   Bridge.provide("get_accel", getAccelerometer);
-  Bridge.provide("servo", onServoCommand);  // NEW
+  Bridge.provide("servo", onServoCommand);
 
-  Serial.println("MCU ready: Ultrasonic + IMU + Servos + Buttons.");
+  Serial.println("MCU ready: Interrupt ultrasonic + IMU + Servos + Buttons.");
 }
 
 // ============================================================
@@ -153,26 +174,22 @@ void loop() {
 
   unsigned long currentMillis = millis();
 
-  // ---- MPU: read at fixed interval ----
+  // ---- MPU ----
   if (imu_initialized && (currentMillis - lastMPURead >= MPU_READ_INTERVAL)) {
     lastMPURead = currentMillis;
     readMPU6050();
   }
 
-  // ---- Ultrasonic (20Hz notify) ----
-  if (currentMillis - previousMillis >= SEND_INTERVAL_MS) {
-    previousMillis = currentMillis;
+  // ---- Ultrasonic ----
+  processUltrasonic();
 
-    int left = checkObstacle(0);
-    int center = checkObstacle(1);
-    int right = checkObstacle(2);
-
-    String data = String(left) + "," + String(center) + "," + String(right);
-    Bridge.notify("ultrasonic", data);
+  // ---- Send data at 20Hz ----
+  if (currentMillis - previousNotifyMillis >= NOTIFY_INTERVAL_MS) {
+    previousNotifyMillis = currentMillis;
+    sendUltrasonicData();
   }
 
-  // ---- SERVO SMOOTHING & CONDITIONAL WRITE ----
-  // Deadband threshold prevents infinite fractional micro-stepping chatter
+  // ---- Servo smoothing ----
   if (abs(target_pan - current_pan) > 0.5) {
     current_pan += (target_pan - current_pan) * EASE_FACTOR;
   } else {
@@ -188,7 +205,6 @@ void loop() {
   int target_pan_int = (int)constrain(round(current_pan), PAN_MIN, PAN_MAX);
   int target_tilt_int = (int)constrain(round(current_tilt), TILT_MIN, TILT_MAX);
 
-  // Only write to hardware pin if integer angle changed
   if (target_pan_int != last_written_pan) {
     servo_pan.write(target_pan_int);
     last_written_pan = target_pan_int;
@@ -201,32 +217,95 @@ void loop() {
 }
 
 // ============================================================
-// ULTRASONIC FUNCTIONS
+// ULTRASONIC – INTERRUPT DRIVEN, NON-BLOCKING
 // ============================================================
-float getDistance(int trig, int echo) {
-  digitalWrite(trig, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trig, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trig, LOW);
-  
-  // CHANGED: Reduced timeout from 15000 to 6000 (~1m max range) to prevent MCU stalls
-  duration = pulseIn(echo, HIGH, 6000);
-  float raw_dist = (duration == 0) ? -1.0 : (duration * 0.034 / 2);
-
-  int idx = (echo == echoPins[0]) ? 0 : (echo == echoPins[1]) ? 1 : 2;
-  if (raw_dist > 0) {
-    if (filtered[idx] < 0) filtered[idx] = raw_dist;
-    else filtered[idx] = (ALPHA * raw_dist) + ((1 - ALPHA) * filtered[idx]);
-    return filtered[idx];
+void echoISR(int idx) {
+  if (digitalRead(echoPins[idx]) == HIGH) {
+    echoStart[idx] = micros();
   } else {
-    filtered[idx] = -1.0;
-    return -1.0;
+    if (echoStart[idx] != 0) {
+      echoDuration[idx] = micros() - echoStart[idx];
+      echoReady[idx] = true;
+      echoStart[idx] = 0;
+    }
+  }
+}
+void echoISR0() { echoISR(0); }
+void echoISR1() { echoISR(1); }
+void echoISR2() { echoISR(2); }
+
+void initUltrasonic() {
+  for (int i = 0; i < 3; i++) {
+    pinMode(trigPins[i], OUTPUT);
+    pinMode(echoPins[i], INPUT);
+    digitalWrite(trigPins[i], LOW);
+  }
+  attachInterrupt(digitalPinToInterrupt(echoPins[0]), echoISR0, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(echoPins[1]), echoISR1, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(echoPins[2]), echoISR2, CHANGE);
+
+  currentSensor = 0;
+  usState = US_TRIG_HIGH;
+  usStateStart = micros();
+}
+
+void processUltrasonic() {
+  unsigned long now = micros();
+
+  switch (usState) {
+
+    case US_TRIG_HIGH:
+      digitalWrite(trigPins[currentSensor], HIGH);
+      usStateStart = now;
+      usState = US_TRIG_LOW;
+      break;
+
+    case US_TRIG_LOW:
+      if (now - usStateStart >= TRIGGER_HIGH_US) {
+        digitalWrite(trigPins[currentSensor], LOW);
+        echoReady[currentSensor] = false;
+        usStateStart = now;
+        usState = US_WAIT_ECHO;
+      }
+      break;
+
+    case US_WAIT_ECHO:
+      if (echoReady[currentSensor]) {
+        float dist = echoDuration[currentSensor] * 0.034 / 2.0;
+        if (filtered[currentSensor] < 0) {
+          filtered[currentSensor] = dist;
+        } else {
+          filtered[currentSensor] = (ALPHA * dist) + ((1 - ALPHA) * filtered[currentSensor]);
+        }
+        echoReady[currentSensor] = false;
+        usStateStart = now;
+        usState = US_COOLDOWN;
+      } else if (now - usStateStart > US_TIMEOUT_US) {
+        filtered[currentSensor] = -1.0; // no object / timeout
+        usStateStart = now;
+        usState = US_COOLDOWN;
+      }
+      break;
+
+    case US_COOLDOWN:
+      if (now - usStateStart >= COOLDOWN_US) {
+        currentSensor = (currentSensor + 1) % 3;
+        usState = US_TRIG_HIGH;
+      }
+      break;
   }
 }
 
+void sendUltrasonicData() {
+  int left = checkObstacle(0);
+  int center = checkObstacle(1);
+  int right = checkObstacle(2);
+  String data = String(left) + "," + String(center) + "," + String(right);
+  Bridge.notify("ultrasonic", data);
+}
+
 int checkObstacle(int sensor_index) {
-  float dist = getDistance(trigPins[sensor_index], echoPins[sensor_index]);
+  float dist = filtered[sensor_index];
   return (dist > 0 && dist < THRESHOLD_CM) ? 1 : 0;
 }
 
@@ -295,7 +374,7 @@ float getIMUHeading() {
 }
 
 // ============================================================
-// SERVO COMMAND CALLBACK (NEW)
+// SERVO COMMAND CALLBACK
 // ============================================================
 void onServoCommand(String data) {
   int comma = data.indexOf(',');
