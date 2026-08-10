@@ -1,7 +1,7 @@
 #include <Arduino_RouterBridge.h>
 #include <OneButton.h>
 #include <SWI2C.h>
-#include <Servo.h>  // NEW
+#include <Servo.h>
 
 // ============================================================
 // SERVO CONFIGURATION (NEW)
@@ -22,10 +22,16 @@ float current_tilt = 90.0;
 float target_pan = 90.0;
 float target_tilt = 90.0;
 
+// Track last written integer angles to prevent identical re-writes
+int last_written_pan = -1;
+int last_written_tilt = -1;
+
 const float EASE_FACTOR = 0.30;
 
+void onServoCommand(String data);
+
 // ============================================================
-// SWI2C CONFIGURATION (UNCHANGED)
+// SWI2C CONFIGURATION
 // ============================================================
 #define SDA_PIN A4
 #define SCL_PIN A5
@@ -34,7 +40,7 @@ const float EASE_FACTOR = 0.30;
 SWI2C mpu(SDA_PIN, SCL_PIN, MPU6050_ADDR);
 
 // ============================================================
-// MPU6050 REGISTERS (UNCHANGED)
+// MPU6050 REGISTERS
 // ============================================================
 #define MPU6050_ACCEL_XOUT_H 0x3B
 #define MPU6050_GYRO_XOUT_H  0x43
@@ -43,13 +49,13 @@ SWI2C mpu(SDA_PIN, SCL_PIN, MPU6050_ADDR);
 #define MPU6050_GYRO_CONFIG  0x1B
 
 // ============================================================
-// SCALING FACTORS (UNCHANGED)
+// SCALING FACTORS
 // ============================================================
-#define ACCEL_SCALE (4096.0 / 9.80665)  // 417.6 LSB per m/s²
-#define GYRO_SCALE 65.5                 // LSB per °/s
+#define ACCEL_SCALE (4096.0 / 9.80665)
+#define GYRO_SCALE 65.5
 
 // ============================================================
-// ULTRASONIC SENSORS (UNCHANGED)
+// ULTRASONIC SENSORS
 // ============================================================
 const int trigPins[3] = {9, 7, 5};
 const int echoPins[3] = {2, 8, 6};
@@ -61,20 +67,20 @@ unsigned long previousMillis = 0;
 const unsigned long SEND_INTERVAL_MS = 50;
 
 // ============================================================
-// BUTTONS (UNCHANGED)
+// BUTTONS
 // ============================================================
 OneButton button(3, true);
 OneButton sos_but(4, true);
 
 // ============================================================
-// MPU CACHE (UNCHANGED)
+// MPU CACHE
 // ============================================================
 float cached_ax, cached_ay, cached_az;
 float cached_gx, cached_gy, cached_gz;
 bool imu_initialized = false;
 
 unsigned long lastMPURead = 0;
-const unsigned long MPU_READ_INTERVAL = 100;  // 20 Hz
+const unsigned long MPU_READ_INTERVAL = 100;
 
 // ============================================================
 // FUNCTION PROTOTYPES
@@ -86,7 +92,6 @@ float getIMUHeading();
 String getAccelerometer();
 bool initMPU6050();
 void readMPU6050();
-void onServoCommand(String data);  // NEW
 
 // ============================================================
 // SETUP
@@ -122,12 +127,20 @@ void setup() {
   servo_tilt.attach(TILT_PIN);
   servo_pan.write(90);
   servo_tilt.write(90);
+  current_pan = 90;
+  current_tilt = 90;
+  target_pan = 90;
+  target_tilt = 90;
+  last_written_pan = 90;
+  last_written_tilt = 90;
 
   // ---- RPC Callbacks ----
   Bridge.provide("ping", pingHandler);
   Bridge.provide("get_heading", getIMUHeading);
   Bridge.provide("get_accel", getAccelerometer);
   Bridge.provide("servo", onServoCommand);  // NEW
+
+  Serial.println("MCU ready: Ultrasonic + IMU + Servos + Buttons.");
 }
 
 // ============================================================
@@ -149,34 +162,46 @@ void loop() {
   // ---- Ultrasonic (20Hz notify) ----
   if (currentMillis - previousMillis >= SEND_INTERVAL_MS) {
     previousMillis = currentMillis;
+
     int left = checkObstacle(0);
     int center = checkObstacle(1);
     int right = checkObstacle(2);
+
     String data = String(left) + "," + String(center) + "," + String(right);
     Bridge.notify("ultrasonic", data);
   }
 
-  // ---- Servo Smoothing (NEW) ----
-  if (abs(target_pan - current_pan) > 0.2) {
+  // ---- SERVO SMOOTHING & CONDITIONAL WRITE ----
+  // Deadband threshold prevents infinite fractional micro-stepping chatter
+  if (abs(target_pan - current_pan) > 0.5) {
     current_pan += (target_pan - current_pan) * EASE_FACTOR;
   } else {
     current_pan = target_pan;
   }
 
-  if (abs(target_tilt - current_tilt) > 0.2) {
+  if (abs(target_tilt - current_tilt) > 0.5) {
     current_tilt += (target_tilt - current_tilt) * EASE_FACTOR;
   } else {
     current_tilt = target_tilt;
   }
 
-  servo_pan.write((int)constrain(current_pan, PAN_MIN, PAN_MAX));
-  servo_tilt.write((int)constrain(current_tilt, TILT_MIN, TILT_MAX));
+  int target_pan_int = (int)constrain(round(current_pan), PAN_MIN, PAN_MAX);
+  int target_tilt_int = (int)constrain(round(current_tilt), TILT_MIN, TILT_MAX);
 
-  delay(15);
+  // Only write to hardware pin if integer angle changed
+  if (target_pan_int != last_written_pan) {
+    servo_pan.write(target_pan_int);
+    last_written_pan = target_pan_int;
+  }
+
+  if (target_tilt_int != last_written_tilt) {
+    servo_tilt.write(target_tilt_int);
+    last_written_tilt = target_tilt_int;
+  }
 }
 
 // ============================================================
-// ULTRASONIC FUNCTIONS (UNCHANGED)
+// ULTRASONIC FUNCTIONS
 // ============================================================
 float getDistance(int trig, int echo) {
   digitalWrite(trig, LOW);
@@ -184,7 +209,9 @@ float getDistance(int trig, int echo) {
   digitalWrite(trig, HIGH);
   delayMicroseconds(10);
   digitalWrite(trig, LOW);
-  duration = pulseIn(echo, HIGH, 15000);
+  
+  // CHANGED: Reduced timeout from 15000 to 6000 (~1m max range) to prevent MCU stalls
+  duration = pulseIn(echo, HIGH, 6000);
   float raw_dist = (duration == 0) ? -1.0 : (duration * 0.034 / 2);
 
   int idx = (echo == echoPins[0]) ? 0 : (echo == echoPins[1]) ? 1 : 2;
@@ -204,17 +231,19 @@ int checkObstacle(int sensor_index) {
 }
 
 // ============================================================
-// MPU6050 FUNCTIONS (UNCHANGED)
+// MPU6050 FUNCTIONS
 // ============================================================
 bool initMPU6050() {
   mpu.begin();
   delay(100);
+
   mpu.writeToRegister(MPU6050_PWR_MGMT_1, 0x00);
   delay(10);
   mpu.writeToRegister(MPU6050_ACCEL_CONFIG, 0x10);
   delay(10);
   mpu.writeToRegister(MPU6050_GYRO_CONFIG, 0x08);
   delay(10);
+
   imu_initialized = true;
   return true;
 }
@@ -243,19 +272,23 @@ void readMPU6050() {
 String getAccelerometer() {
   if (!imu_initialized) return "0.00,0.00,0.00";
   char buffer[64];
-  snprintf(buffer, sizeof(buffer), "%.2f,%.2f,%.2f", cached_ax, cached_ay, cached_az);
+  snprintf(buffer, sizeof(buffer), "%.2f,%.2f,%.2f",
+           cached_ax, cached_ay, cached_az);
   return String(buffer);
 }
 
 float getIMUHeading() {
   if (!imu_initialized) return 0.0;
+
   static float yaw = 0.0;
   static unsigned long lastTime = micros();
   unsigned long currentTime = micros();
   float dt = (currentTime - lastTime) / 1000000.0;
   lastTime = currentTime;
+
   float gyroZ = cached_gz;
   yaw += gyroZ * dt;
+
   if (yaw < 0) yaw += 360;
   if (yaw >= 360) yaw -= 360;
   return yaw;
@@ -269,13 +302,14 @@ void onServoCommand(String data) {
   if (comma > 0) {
     int pan = data.substring(0, comma).toInt();
     int tilt = data.substring(comma + 1).toInt();
+
     target_pan = constrain(pan, PAN_MIN, PAN_MAX);
     target_tilt = constrain(tilt, TILT_MIN, TILT_MAX);
   }
 }
 
 // ============================================================
-// BUTTON CALLBACKS (UNCHANGED)
+// BUTTON CALLBACKS
 // ============================================================
 void shortClick_sos() {
   Bridge.notify("SOS", "sos");
@@ -294,7 +328,7 @@ void longClick() {
 }
 
 // ============================================================
-// SYSTEM CALLBACKS (UNCHANGED)
+// SYSTEM CALLBACKS
 // ============================================================
 int pingHandler() {
   return 1;

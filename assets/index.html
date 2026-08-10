@@ -3,338 +3,302 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Diya 2 Controller</title>
+    <title>Diya 2 – Navigation & Vision Assistant</title>
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 20px;
-            background: #1e1e2e;
-            color: white;
-        }
-        .header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 20px;
-        }
-        .main-content {
-            display: flex;
-            gap: 20px;
-        }
-        .left-column {
-            flex: 2;
-        }
-        .right-column {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            gap: 15px;
-        }
-        .container {
-            background: #2d2d44;
-            padding: 15px;
-            border-radius: 8px;
-        }
-        .video-container {
-            position: relative;
-            width: 100%;
-            max-width: 640px;
-        }
-        #videoFeedContainer {
-            position: relative;
-            width: 100%;
-            padding-bottom: 75%;
-            background: #1a1a2e;
-            border-radius: 8px;
-            overflow: hidden;
-        }
-        #videoPlaceholder {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-        }
-        #dynamicIframe {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            border: none;
-        }
-        .controls-section {
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }
-        .control-group {
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-        }
-        .control-confidence {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-        .slider-box {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .slider-container {
-            flex: 1;
-            position: relative;
-        }
-        .slider-progress {
-            position: absolute;
-            height: 4px;
-            background: #4CAF50;
-            border-radius: 2px;
-            pointer-events: none;
-            top: 50%;
-            transform: translateY(-50%);
-        }
-        .confidence-value-display {
-            position: absolute;
-            top: -20px;
-            transform: translateX(-50%);
-            font-size: 12px;
-            color: #aaa;
-        }
-        input[type="range"] {
-            width: 100%;
-            -webkit-appearance: none;
-            background: #444;
-            height: 4px;
-            border-radius: 2px;
-            outline: none;
-        }
-        input[type="range"]::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            width: 16px;
-            height: 16px;
-            border-radius: 50%;
-            background: #4CAF50;
-            cursor: pointer;
-        }
-        .confidence-limits {
-            font-size: 12px;
-            color: #888;
-        }
-        #feedback-content {
-            min-height: 80px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        #recentDetections {
-            list-style: none;
-            padding: 0;
-            max-height: 200px;
-            overflow-y: auto;
-        }
-        #recentDetections li {
-            padding: 5px 0;
-            border-bottom: 1px solid #444;
-            font-size: 14px;
-        }
-        .scan-container {
-            padding: 5px 0;
-            border-bottom: 1px solid #444;
-        }
-        .scan-content {
-            display: block;
-        }
-        .scan-content-time {
-            font-size: 12px;
-            color: #888;
-        }
-        .text-input-section {
-            margin-top: 15px;
-        }
-        .text-input-section input {
-            padding: 8px;
-            border-radius: 4px;
-            border: none;
-            width: 70%;
-            background: #3d3d5c;
-            color: white;
-        }
-        .text-input-section button {
-            padding: 8px 16px;
-            border-radius: 4px;
-            border: none;
-            background: #4CAF50;
-            color: white;
-            cursor: pointer;
-            margin-left: 5px;
-        }
-        .text-input-section button:hover {
-            background: #45a049;
-        }
-        #sos {
-            color: #ff4444;
-            font-weight: bold;
-            margin-top: 10px;
-        }
-        #output {
-            color: #aaa;
-            margin-top: 5px;
-        }
-        .tracking-controls {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .tracking-controls button {
-            padding: 5px 15px;
-            border-radius: 4px;
-            border: none;
-            cursor: pointer;
-        }
-        .tracking-controls .btn-on {
-            background: #4CAF50;
-            color: white;
-        }
-        .tracking-controls .btn-off {
-            background: #ff4444;
-            color: white;
-        }
-        .tracking-status {
-            font-weight: bold;
-        }
-        .status-on { color: #4CAF50; }
-        .status-off { color: #ff4444; }
-        .info-btn {
-            cursor: pointer;
-            width: 16px;
-            height: 16px;
-        }
-        .popover {
-            display: none;
-            position: absolute;
-            background: #444;
-            padding: 8px 12px;
-            border-radius: 4px;
-            font-size: 12px;
-            max-width: 200px;
-            z-index: 10;
-        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: Arial, sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: #16213e; border-radius: 10px; margin-bottom: 20px; flex-wrap: wrap; gap: 10px; }
+        .header h1 { font-size: 24px; color: #e94560; }
+        .header-controls { display: flex; align-items: center; gap: 15px; flex-wrap: wrap; }
+        .header-controls button { padding: 8px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; }
+        .btn-on { background: #2ecc71; color: #fff; }
+        .btn-off { background: #e74c3c; color: #fff; }
+        .tracking-status { font-weight: bold; color: #f1c40f; }
+        .main-content { display: flex; gap: 20px; flex-wrap: wrap; }
+        .video-container { flex: 2; min-width: 400px; background: #16213e; border-radius: 10px; padding: 15px; }
+        .video-container iframe { width: 100%; height: 480px; border: none; border-radius: 5px; background: #0f3460; }
+        .right-panel { flex: 1; min-width: 300px; display: flex; flex-direction: column; gap: 20px; }
+        .panel { background: #16213e; border-radius: 10px; padding: 15px; }
+        .panel-title { font-size: 16px; font-weight: bold; color: #e94560; margin-bottom: 10px; }
+        .controls-section .control-group { margin-bottom: 15px; }
+        .control-confidence { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .control-confidence label { font-size: 14px; }
+        .confidence-input { width: 60px; padding: 5px; border-radius: 4px; border: 1px solid #444; background: #0f3460; color: #fff; text-align: center; }
+        .slider-box { display: flex; align-items: center; gap: 10px; }
+        .slider-container { flex: 1; position: relative; height: 30px; }
+        .slider-progress { position: absolute; left: 0; top: 50%; transform: translateY(-50%); height: 4px; background: #e94560; border-radius: 2px; pointer-events: none; }
+        .confidence-value-display { position: absolute; top: 50%; transform: translate(-50%, -50%); font-size: 12px; color: #fff; background: #e94560; padding: 2px 8px; border-radius: 10px; }
+        input[type="range"] { width: 100%; -webkit-appearance: none; background: transparent; position: relative; z-index: 1; }
+        input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #e94560; cursor: pointer; }
+        .feedback-content { min-height: 100px; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #0f3460; border-radius: 5px; padding: 15px; }
+        .feedback-content img { max-width: 80px; max-height: 80px; }
+        .feedback-text { color: #aaa; font-size: 14px; margin-top: 10px; }
+        .detections-list { max-height: 200px; overflow-y: auto; list-style: none; padding: 0; }
+        .detections-list li { padding: 8px 10px; border-bottom: 1px solid #2a3a5e; font-size: 13px; display: flex; justify-content: space-between; }
+        .detections-list li:last-child { border-bottom: none; }
+        .detection-label { font-weight: bold; color: #f1c40f; }
+        .detection-conf { color: #2ecc71; }
+        .detection-time { color: #888; font-size: 11px; }
+        .input-area { display: flex; gap: 10px; margin-top: 10px; }
+        .input-area input { flex: 1; padding: 10px; border-radius: 5px; border: 1px solid #444; background: #0f3460; color: #fff; }
+        .input-area button { padding: 10px 25px; border: none; border-radius: 5px; background: #e94560; color: #fff; cursor: pointer; }
+        .input-area button:hover { background: #c0392b; }
+        .sos-display { margin-top: 10px; padding: 10px; background: #2a1a1a; border-radius: 5px; border: 1px solid #e74c3c; color: #e74c3c; font-weight: bold; }
+        .no-detections { color: #666; text-align: center; padding: 20px; }
+        @media (max-width: 768px) { .main-content { flex-direction: column; } .video-container { min-width: auto; } .video-container iframe { height: 300px; } }
     </style>
 </head>
 <body>
+<div class="container">
+    <!-- Header -->
     <div class="header">
-        <h1>Diya 2</h1>
-        <div class="tracking-controls">
+        <h1>🎯 Diya 2 – Navigation & Vision</h1>
+        <div class="header-controls">
             <span>Tracking:</span>
-            <span id="tracking_status" class="status-on">ON</span>
-            <button onclick="toggleTracking('on')" class="btn-on">ON</button>
-            <button onclick="toggleTracking('off')" class="btn-off">OFF</button>
+            <button class="btn-on" id="trackOnBtn" onclick="toggleTracking('on')">ON</button>
+            <button class="btn-off" id="trackOffBtn" onclick="toggleTracking('off')">OFF</button>
+            <span class="tracking-status" id="tracking_status">ON</span>
         </div>
     </div>
 
+    <!-- Main Content -->
     <div class="main-content">
-        <div class="left-column">
-            <div class="container video-container">
-                <div id="videoFeedContainer">
-                    <div id="videoPlaceholder" class="camera-status">
-                        <img src="./img/no-face.svg" alt="Searching webcam" />
-                        <p class="feedback-text">Searching Webcam...</p>
-                    </div>
-                    <iframe
-                        id="dynamicIframe"
-                        title="Video stream"
-                        frameborder="0"
-                        style="display: none;"></iframe>
-                </div>
+        <!-- Video Feed -->
+        <div class="video-container" id="video-container">
+            <div id="videoPlaceholder" class="camera-status" style="text-align:center;padding:40px;color:#888;">
+                <p>📷 Loading camera...</p>
             </div>
-
-            <div class="container text-input-section">
-                <input id="txt" type="text" placeholder="Type a message...">
-                <button onclick="sendText()">Send</button>
-                <p id="output"></p>
-                <p id="sos"></p>
-            </div>
+            <iframe id="dynamicIframe" title="Video stream" frameborder="0" style="display:none;width:100%;height:480px;border-radius:5px;background:#0f3460;"></iframe>
         </div>
 
-        <div class="right-column">
-            <div class="container">
-                <div class="controls-section">
-                    <div class="control-group">
-                        <div class="control-confidence">
-                            <div style="display: flex; align-items: center; gap: 8px; position: relative">
-                                <label id="confidence-label" for="confidenceSlider">Confidence</label>
-                                <img src="./img/info.svg" alt="Info" class="info-btn confidence" />
-                                <div class="popover">Minimum confidence score for detected objects.</div>
-                            </div>
-                            <button id="confidenceResetButton">
-                                <input type="number" id="confidenceInput" min="0" max="1" step="0.05" value="0.50" />
-                                <img src="img/icon-reset.svg" alt="Reset" style="width:16px;cursor:pointer;" />
-                            </button>
+        <!-- Right Panel -->
+        <div class="right-panel">
+            <!-- Confidence Slider -->
+            <div class="panel controls-section">
+                <div class="panel-title">🎚️ Confidence</div>
+                <div class="control-group">
+                    <div class="control-confidence">
+                        <label for="confidenceSlider">Threshold</label>
+                        <button id="confidenceResetButton" class="btn-tertiary" style="background:transparent;border:none;cursor:pointer;">
+                            <input type="number" id="confidenceInput" class="confidence-input" min="0" max="1" step="0.05" value="0.50" />
+                            <span style="color:#888;font-size:12px;">↺</span>
+                        </button>
+                    </div>
+                    <div class="slider-box">
+                        <span class="confidence-limits" style="color:#666;font-size:12px;">0</span>
+                        <div class="slider-container">
+                            <div class="slider-progress" id="sliderProgress" style="width:50%;"></div>
+                            <div class="confidence-value-display" id="confidenceValueDisplay" style="left:50%;">0.50</div>
+                            <input type="range" id="confidenceSlider" min="0" max="1" step="0.01" value="0.5" />
                         </div>
-                        <div class="slider-box">
-                            <span class="confidence-limits">0</span>
-                            <div class="slider-container">
-                                <div class="slider-progress" id="sliderProgress"></div>
-                                <div class="confidence-value-display" id="confidenceValueDisplay">0.5</div>
-                                <input type="range" id="confidenceSlider" min="0" max="1" step="0.01" value="0.5" />
-                            </div>
-                            <span class="confidence-limits">1</span>
-                        </div>
+                        <span class="confidence-limits" style="color:#666;font-size:12px;">1</span>
                     </div>
                 </div>
             </div>
 
-            <div class="container">
-                <div style="display: flex; align-items: center; gap: 8px; position: relative">
-                    <h2 style="margin:0;">Feedback</h2>
-                    <img src="./img/info.svg" alt="Info" class="info-btn feedback" />
-                    <div class="popover">System response will appear here.</div>
-                </div>
-                <div id="feedback-content">
-                    <img src="img/stars.svg" alt="Stars" />
+            <!-- Feedback -->
+            <div class="panel">
+                <div class="panel-title">💬 Feedback</div>
+                <div id="feedback-content" class="feedback-content">
+                    <img src="img/stars.svg" alt="Stars" style="width:60px;height:60px;" />
                     <p class="feedback-text">System response will appear here</p>
                 </div>
             </div>
 
-            <div class="container">
-                <h2>Recent detections</h2>
-                <ul id="recentDetections">
-                    <li>No objects detected yet</li>
+            <!-- Recent Detections -->
+            <div class="panel">
+                <div class="panel-title">📋 Recent Detections</div>
+                <ul id="recentDetections" class="detections-list">
+                    <li class="no-detections">No objects detected yet</li>
                 </ul>
             </div>
         </div>
     </div>
 
-    <div id="error-container" style="display:none;color:#ff4444;"></div>
+    <!-- Input Area -->
+    <div class="panel" style="margin-top:20px;">
+        <div class="panel-title">⌨️ Send Command</div>
+        <div class="input-area">
+            <input id="txt" type="text" placeholder="Type a message or command..." />
+            <button onclick="sendText()">Send</button>
+        </div>
+        <div id="output" style="color:#aaa;margin-top:10px;"></div>
+        <div id="sos" class="sos-display" style="display:none;"></div>
+    </div>
+</div>
 
-    <script>
-        const iframe = document.getElementById('dynamicIframe');
-        const placeholder = document.getElementById('videoPlaceholder');
-        const currentHostname = window.location.hostname;
-        const targetPort = 4912;
-        const targetPath = '/embed';
-        const streamUrl = `http://${currentHostname}:${targetPort}${targetPath}`;
+<!-- ============================================================ -->
+<!-- Scripts -->
+<!-- ============================================================ -->
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script>
+const socket = io();
 
-        let intervalId;
+// ---- Connection ----
+socket.on("connect", () => {
+    console.log("Connected to server.");
+});
 
-        iframe.onload = () => {
-            if (intervalId) clearInterval(intervalId);
-            placeholder.style.display = 'none';
-            iframe.style.display = 'block';
+socket.on("disconnect", () => {
+    console.log("Disconnected.");
+});
+
+// ---- Raw Text ----
+function sendText() {
+    const text = document.getElementById("txt").value;
+    if (text.trim()) {
+        socket.emit("raw_text", text);
+        document.getElementById("txt").value = "";
+    }
+}
+
+socket.on("reply", (msg) => {
+    document.getElementById("output").innerText = msg;
+});
+
+// ---- SOS ----
+socket.on("sos", (msg) => {
+    const el = document.getElementById("sos");
+    el.innerText = "🚨 " + msg;
+    el.style.display = "block";
+    setTimeout(() => { el.style.display = "none"; }, 10000);
+});
+
+// ---- Video Feed ----
+(function initVideo() {
+    const iframe = document.getElementById('dynamicIframe');
+    const placeholder = document.getElementById('videoPlaceholder');
+    const currentHostname = window.location.hostname;
+    const targetPort = 4912;
+    const targetPath = '/embed';
+    const streamUrl = `http://${currentHostname}:${targetPort}${targetPath}`;
+
+    let intervalId;
+
+    iframe.onload = () => {
+        if (intervalId) clearInterval(intervalId);
+        placeholder.style.display = 'none';
+        iframe.style.display = 'block';
+    };
+
+    const startLoading = () => {
+        iframe.src = streamUrl;
+    };
+
+    intervalId = setInterval(startLoading, 1000);
+})();
+
+// ---- Confidence Slider ----
+const confidenceSlider = document.getElementById('confidenceSlider');
+const confidenceInput = document.getElementById('confidenceInput');
+const confidenceValueDisplay = document.getElementById('confidenceValueDisplay');
+const sliderProgress = document.getElementById('sliderProgress');
+const resetBtn = document.getElementById('confidenceResetButton');
+
+function updateConfidenceDisplay() {
+    const value = parseFloat(confidenceSlider.value);
+    const percentage = ((value - confidenceSlider.min) / (confidenceSlider.max - confidenceSlider.min)) * 100;
+    confidenceValueDisplay.textContent = value.toFixed(2);
+    if (document.activeElement !== confidenceInput) {
+        confidenceInput.value = value.toFixed(2);
+    }
+    sliderProgress.style.width = percentage + '%';
+    confidenceValueDisplay.style.left = percentage + '%';
+    socket.emit("override_th", value);
+}
+
+confidenceSlider.addEventListener('input', updateConfidenceDisplay);
+confidenceInput.addEventListener('input', () => {
+    let val = parseFloat(confidenceInput.value);
+    if (isNaN(val)) val = 0.5;
+    if (val < 0) val = 0;
+    if (val > 1) val = 1;
+    confidenceSlider.value = val;
+    updateConfidenceDisplay();
+});
+resetBtn.addEventListener('click', () => {
+    confidenceSlider.value = '0.5';
+    confidenceInput.value = '0.50';
+    updateConfidenceDisplay();
+});
+updateConfidenceDisplay();
+
+// ---- Tracking Toggle ----
+function toggleTracking(state) {
+    socket.emit("toggle_tracking", state);
+    document.getElementById("tracking_status").innerText = state === "on" ? "ON" : "OFF";
+    document.getElementById("trackOnBtn").className = state === "on" ? "btn-on" : "btn-off";
+    document.getElementById("trackOffBtn").className = state === "off" ? "btn-off" : "btn-on";
+}
+
+// ---- Detections ----
+const MAX_RECENT_SCANS = 5;
+let scans = [];
+
+socket.on("detection", (message) => {
+    console.log("Detection:", message);
+    scans.unshift(message);
+    if (scans.length > MAX_RECENT_SCANS) scans.pop();
+    renderDetections();
+    updateFeedback(message);
+});
+
+function renderDetections() {
+    const el = document.getElementById('recentDetections');
+    if (scans.length === 0) {
+        el.innerHTML = `<li class="no-detections">No objects detected yet</li>`;
+        return;
+    }
+    el.innerHTML = scans.map(scan => {
+        const confidence = Math.floor((scan.confidence || 0) * 100);
+        const label = scan.content || "unknown";
+        const time = scan.timestamp ? new Date(scan.timestamp).toLocaleTimeString() : "now";
+        return `<li><span><span class="detection-label">${label}</span> <span class="detection-conf">${confidence}%</span></span><span class="detection-time">${time}</span></li>`;
+    }).join('');
+}
+
+function updateFeedback(detection) {
+    const el = document.getElementById('feedback-content');
+    if (detection && detection.content) {
+        const label = detection.content;
+        const confidence = Math.floor((detection.confidence || 0) * 100);
+        const gifMap = {
+            'cat': 'cat.webp',
+            'cell phone': 'phone.webp',
+            'clock': 'clock.webp',
+            'cup': 'cup.webp',
+            'dog': 'dog.webp',
+            'potted plant': 'plant.webp'
         };
+        const gif = gifMap[label] || null;
+        if (gif) {
+            el.innerHTML = `
+                <div style="display:flex;flex-direction:column;align-items:center;">
+                    <div style="font-size:28px;font-weight:bold;color:#f1c40f;">${confidence}%</div>
+                    <img src="img/${gif}" alt="${label}" style="max-width:80px;max-height:80px;margin:5px 0;">
+                    <p style="color:#2ecc71;font-weight:bold;">${label}</p>
+                </div>
+            `;
+        } else {
+            el.innerHTML = `
+                <div style="display:flex;flex-direction:column;align-items:center;">
+                    <div style="font-size:28px;font-weight:bold;color:#f1c40f;">${confidence}%</div>
+                    <p style="color:#2ecc71;font-weight:bold;">${label}</p>
+                    <p style="color:#888;font-size:12px;">No GIF for this object</p>
+                </div>
+            `;
+        }
+    } else {
+        el.innerHTML = `
+            <img src="img/stars.svg" alt="Stars" style="width:60px;height:60px;" />
+            <p class="feedback-text">System response will appear here</p>
+        `;
+    }
+}
 
-        const startLoading = () => { iframe.src = streamUrl; };
-        intervalId = setInterval(startLoading, 1000);
-    </script>
-
-    <script src="/socket.io/socket.io.js"></script>
-    <script src="app.js"></script>
+// ---- Detect Money from UI (optional) ----
+// You can add a button to trigger currency detection if needed
+</script>
 </body>
 </html>

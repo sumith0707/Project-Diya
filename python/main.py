@@ -6,22 +6,26 @@ import json
 import cv2
 import numpy as np
 import sounddevice as sd
+from datetime import datetime, UTC
 
 # ========== Configuration ==========
-BOARD_IP = "192.168.0.105"
+BOARD_IP = "192.168.0.106"
 os.environ["ARDUINO_BOARD_IP"] = BOARD_IP
 
 from arduino.app_utils import Bridge, App
 from arduino.app_bricks.web_ui import WebUI
 from arduino.app_bricks.video_imageclassification import VideoImageClassification
 from arduino.app_bricks.video_objectdetection import VideoObjectDetection
+from arduino.app_peripherals.camera import Camera
 from osm_nav import OsmNavigationEngine
 from emergency_manager import EmergencyManager
 from voice_recognition import VoiceRecognition
 from imu_module import IMUReader
 from tts_manager import TTSManager
 
-# ========== TTS Setup ==========
+# ============================================================
+# TTS Setup
+# ============================================================
 BASE_DIR = "/app"
 piper_bin = os.path.join(BASE_DIR, "piper", "piper")
 model_path = os.path.join(BASE_DIR, "piper_voices", "en_US-lessac-medium.onnx")
@@ -34,20 +38,38 @@ except Exception as e:
     tts = None
 
 def speak(text):
+    """Helper to speak text via TTS."""
     if tts is None:
         print(f"[TTS] Not available: {text}")
         return
     tts.speak_async(text)
     print(f"[TTS] Speaking: {text}")
 
-# ========== WebUI instance ==========
+# ============================================================
+# WebUI
+# ============================================================
 ui = WebUI()
 
-# ========== Navigation Engine ==========
+# ============================================================
+# Shared Camera
+# ============================================================
+# A single USBCamera instance shared by every video brick in this app.
+# VideoObjectDetection and VideoImageClassification each open their own
+# exclusive V4L2 capture session when no `camera` is passed in, and most
+# USB webcams only support one exclusive capture session at a time. Passing
+# the same USBCamera instance into both bricks avoids that contention.
+shared_camera = Camera(source=0, resolution=(640, 480), fps=10)
+shared_camera.start()
+
+# ============================================================
+# Navigation Engine
+# ============================================================
 DESTINATION_NAME = "Mangalore"
 nav_engine = OsmNavigationEngine(destination_name=DESTINATION_NAME)
 
-# ========== IMU Setup ==========
+# ============================================================
+# IMU Setup
+# ============================================================
 try:
     imu = IMUReader()
     nav_engine.set_imu(imu)
@@ -56,18 +78,24 @@ except Exception as e:
     print(f"IMU initialization failed: {e}")
     nav_engine.set_imu(None)
 
-# ========== Emergency Manager ==========
+# ============================================================
+# Emergency Manager
+# ============================================================
 emergency = EmergencyManager(imu=imu)
 emergency.set_ui(ui)
 emergency.start_fall_detection()
 
-# ========== Shared GPS data ==========
+# ============================================================
+# GPS Data
+# ============================================================
 gps_data = {"lat": 0.0, "lng": 0.0, "fix": False, "last_update": 0.0}
 gps_lock = threading.Lock()
 lat2 = 0.0
 lng2 = 0.0
 
-# ========== Voice Recognition Setup ==========
+# ============================================================
+# Voice Recognition
+# ============================================================
 try:
     voice = VoiceRecognition(
         model_name="tiny",
@@ -83,18 +111,138 @@ except Exception as e:
     voice = None
 
 # ============================================================
-# OBJECT DETECTION MANAGER (Merged from test app)
+# Currency Detector (Existing – Unchanged, now uses shared camera)
+# ============================================================
+class CurrencyDetector:
+    def __init__(self, confidence_threshold=0.5, camera=None):
+        # The brick itself is NOT constructed here. It's created fresh each
+        # time currency-detection mode starts, and torn down when it ends,
+        # so the classification runner only receives frames and runs
+        # inference while this mode is actually active.
+        self.camera = camera
+        self.confidence_threshold = confidence_threshold
+        self.classifier = None
+        self.is_running = False
+        self.last_label = None
+        self.detection_start_time = None
+        self.detection_duration = 2.0
+        self.callback = None
+        print("[Currency] Detector ready (lazy - brick not yet started).")
+
+    def start(self, callback=None):
+        if self.is_running:
+            print("[Currency] Already running.")
+            return
+
+        # Construct the brick on demand.
+        self.classifier = VideoImageClassification(
+            camera=self.camera,
+            confidence=self.confidence_threshold,
+            debounce_sec=0.0,
+        )
+
+        def process_wrapper(classifications):
+            self._process_results(classifications)
+
+        self.classifier.on_detect_all(process_wrapper)
+        self.classifier.start()
+
+        self.is_running = True
+        self.callback = callback
+        self.last_label = None
+        self.detection_start_time = None
+        print("[Currency] Detection started. Hold note in front of camera.")
+
+    def stop(self):
+        self.is_running = False
+        self.last_label = None
+        self.detection_start_time = None
+
+        if self.classifier is not None:
+            classifier_to_stop = self.classifier
+            self.classifier = None
+            try:
+                classifier_to_stop.stop()
+            except Exception as e:
+                print(f"[Currency] Error stopping classifier: {e}")
+
+        print("[Currency] Detection stopped.")
+
+    def _stop_async(self):
+        """Tear down the classifier from a separate thread.
+
+        Used when triggered from inside the classifier's own callback
+        (see _process_results) to avoid the callback thread blocking on
+        its own brick's stop()/join() call.
+        """
+        threading.Thread(target=self.stop, daemon=True).start()
+
+    def _process_results(self, classifications: dict):
+        if not self.is_running:
+            return
+        if not classifications:
+            self.last_label = None
+            self.detection_start_time = None
+            return
+
+        best_label = None
+        best_confidence = 0
+        for label, confidence in classifications.items():
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_label = label
+
+        print(f"[Currency] All: {classifications}")
+
+        if best_confidence < self.confidence_threshold:
+            self.last_label = None
+            self.detection_start_time = None
+            return
+
+        now = time.time()
+        if best_label == self.last_label:
+            if self.detection_start_time is None:
+                self.detection_start_time = now
+                print(f"[Currency] First detection: {best_label} ({best_confidence:.2f})")
+            elif now - self.detection_start_time >= self.detection_duration:
+                print(f"[Currency] CONFIRMED: {best_label} (held for {now - self.detection_start_time:.1f}s)")
+                self.is_running = False
+                self.last_label = None
+                self.detection_start_time = None
+                callback = self.callback
+                # Tear down the brick asynchronously - we're currently
+                # running inside its own callback thread.
+                self._stop_async()
+                if callback:
+                    callback(best_label)
+        else:
+            self.last_label = best_label
+            self.detection_start_time = now
+            print(f"[Currency] New label: {best_label} ({best_confidence:.2f})")
+
+currency_detector = CurrencyDetector(confidence_threshold=0.70, camera=shared_camera)
+
+def on_currency_detected(label):
+    print(f"[Currency] CONFIRMED: {label}")
+    speak(f"This is a {label} note")
+    resume_object_detection()
+
+# ============================================================
+# OBJECT DETECTION MANAGER (Merged from test project, now uses shared camera)
 # ============================================================
 class ObjectDetectionManager:
-    def __init__(self, ui):
-        self.ui = ui
-        self.detection_stream = VideoObjectDetection(confidence=0.2, debounce_sec=0.0)
+    def __init__(self, camera=None):
+        self.detection_stream = VideoObjectDetection(
+            camera=camera,
+            confidence=0.2,
+            debounce_sec=0.0,
+        )
 
-        # ---- Frame & Servo Boundaries ----
+        # Frame & Servo Boundaries
         self.FRAME_WIDTH = 640
         self.FRAME_HEIGHT = 480
-        self.FRAME_CENTER_X = 320
-        self.FRAME_CENTER_Y = 240
+        self.FRAME_CENTER_X = self.FRAME_WIDTH // 2
+        self.FRAME_CENTER_Y = self.FRAME_HEIGHT // 2
 
         self.PAN_MIN = 20
         self.PAN_MAX = 160
@@ -108,97 +256,77 @@ class ObjectDetectionManager:
 
         self.current_pan_angle = 90.0
         self.current_tilt_angle = 90.0
+
         self.tracking_enabled = True
         self.last_detection_time = time.time()
         self.DETECTION_TIMEOUT = 7.0
         self.RECENTER_EASE = 0.1
 
-        # ---- Object Lock ----
+        # Object Lock
         self.LOCK_DURATION = 5.0
         self.locked_label = None
         self.lock_start_time = 0.0
 
-        # ---- Threading ----
+        # Threading
         self.latest_center = None
         self.has_new_target = False
         self.target_lock = threading.Lock()
         self.servo_thread = None
-        self.is_running = False
-        self.is_paused = False  # Paused for currency detection
+        self.running = False
+        self.paused = False
 
-        # ---- Register WebUI handlers ----
-        self.ui.on_message("override_th", self._on_override_threshold)
-        self.ui.on_message("toggle_tracking", self._on_toggle_tracking)
+        # Register WebUI handlers
+        ui.on_message("override_th", self.on_override_threshold)
+        ui.on_message("toggle_tracking", self.on_toggle_tracking)
 
-    def _on_override_threshold(self, sid, threshold):
-        self.detection_stream.override_threshold(float(threshold))
+        self.last_sent_pan = -1
+        self.last_sent_tilt = -1
 
-    def _on_toggle_tracking(self, sid, state):
+        # ========== FIX: Use a wrapper function for the callback ==========
+        def detection_wrapper(detections):
+            self.send_detections_to_ui(detections)
+
+        self.detection_stream.on_detect_all(detection_wrapper)
+
+    def on_override_threshold(self, sid, threshold):
+        try:
+            self.detection_stream.override_threshold(float(threshold))
+            print(f"[ObjectDetect] Threshold updated to {threshold}")
+        except Exception as e:
+            print(f"[ObjectDetect] Error: {e}")
+
+    def on_toggle_tracking(self, sid, state):
         self.tracking_enabled = (state == "on")
-        print(f"[ObjDetect] Tracking {'enabled' if self.tracking_enabled else 'disabled'}.")
+        print(f"[ObjectDetect] Tracking {'enabled' if self.tracking_enabled else 'disabled'}.")
         if not self.tracking_enabled:
             self.locked_label = None
             self.current_pan_angle = 90.0
             self.current_tilt_angle = 90.0
-            self._set_servo_target(90, 90)
+            self.set_servo_target(90, 90)
 
-    def _set_servo_target(self, pan, tilt):
-        pan = max(self.PAN_MIN, min(self.PAN_MAX, int(pan)))
-        tilt = max(self.TILT_MIN, min(self.TILT_MAX, int(tilt)))
-        try:
-            Bridge.notify("servo", f"{pan},{tilt}")
-        except Exception as e:
-            print(f"[ObjDetect] Servo error: {e}")
+    def set_servo_target(self, pan, tilt):
+        # Convert float angles to rounded integers
+        pan = max(self.PAN_MIN, min(self.PAN_MAX, int(round(pan))))
+        tilt = max(self.TILT_MIN, min(self.TILT_MAX, int(round(tilt))))
 
-    def _servo_control_loop(self):
-        while self.is_running:
-            if not self.is_paused:
-                with self.target_lock:
-                    center = self.latest_center
-                    new_target = self.has_new_target
-                    self.has_new_target = False
+        # 2. MODIFY THIS: Only fire RPC when an actual degree step occurs
+        if pan != self.last_sent_pan or tilt != self.last_sent_tilt:
+            try:
+                Bridge.notify("servo", f"{pan},{tilt}")
+                self.last_sent_pan = pan
+                self.last_sent_tilt = tilt
+            except Exception as e:
+                print(f"[ObjectDetect] Servo error: {e}")
 
-                if self.tracking_enabled and new_target and center is not None:
-                    cx, cy = center
-                    error_x = cx - self.FRAME_CENTER_X
-                    error_y = cy - self.FRAME_CENTER_Y
+    def send_detections_to_ui(self, detections: dict):
+        # If paused, ignore detections
+        if self.paused:
+            return
 
-                    if abs(error_x) < self.DEAD_ZONE_X:
-                        error_x = 0
-                    if abs(error_y) < self.DEAD_ZONE_Y:
-                        error_y = 0
-
-                    self.current_pan_angle -= error_x * self.KP_PAN
-                    self.current_tilt_angle -= error_y * self.KP_TILT
-
-                    self.current_pan_angle = max(self.PAN_MIN, min(self.PAN_MAX, self.current_pan_angle))
-                    self.current_tilt_angle = max(self.TILT_MIN, min(self.TILT_MAX, self.current_tilt_angle))
-
-                    self.last_detection_time = time.time()
-                    self._set_servo_target(self.current_pan_angle, self.current_tilt_angle)
-
-                else:
-                    time_since_detection = time.time() - self.last_detection_time
-                    if self.tracking_enabled and time_since_detection > self.DETECTION_TIMEOUT:
-                        pan_diff = 90.0 - self.current_pan_angle
-                        tilt_diff = 90.0 - self.current_tilt_angle
-                        if abs(pan_diff) > 0.5 or abs(tilt_diff) > 0.5:
-                            self.current_pan_angle += pan_diff * self.RECENTER_EASE
-                            self.current_tilt_angle += tilt_diff * self.RECENTER_EASE
-                            self._set_servo_target(self.current_pan_angle, self.current_tilt_angle)
-                        elif self.current_pan_angle != 90.0 or self.current_tilt_angle != 90.0:
-                            self.current_pan_angle = 90.0
-                            self.current_tilt_angle = 90.0
-                            self._set_servo_target(90, 90)
-
-            time.sleep(0.033)
-
-    def _detection_callback(self, detections: dict):
-        """Called by the detection brick on every frame."""
         best_center = None
         now = time.time()
 
-        # Forward to WebUI
+        # Forward raw detections to WebUI
         if detections:
             for key, values in detections.items():
                 for value in values:
@@ -207,13 +335,9 @@ class ObjectDetectionManager:
                         "confidence": value.get("confidence"),
                         "timestamp": datetime.now(UTC).isoformat()
                     }
-                    self.ui.send_message("detection", message=entry)
+                    ui.send_message("detection", message=entry)
 
-        # ---- Don't process if paused ----
-        if self.is_paused:
-            return
-
-        # ---- Target Selection with Lock ----
+        # Target Selection with 5-Second Lock
         lock_active = (self.locked_label is not None) and ((now - self.lock_start_time) < self.LOCK_DURATION)
 
         if lock_active:
@@ -250,7 +374,7 @@ class ObjectDetectionManager:
                     self.locked_label = selected_label
                     self.lock_start_time = now
                     best_center = selected_center
-                    print(f"[ObjDetect] Locked onto '{selected_label}' (Conf: {highest_conf:.2f})")
+                    print(f"[ObjectDetect] Locked onto '{self.locked_label}' (Conf: {highest_conf:.2f}) for 5s.")
             else:
                 self.locked_label = None
 
@@ -259,151 +383,97 @@ class ObjectDetectionManager:
                 self.latest_center = best_center
                 self.has_new_target = True
 
+    def servo_control_loop(self):
+        while self.running:
+            # If paused, skip updating servos
+            if self.paused:
+                time.sleep(0.05)
+                continue
+
+            with self.target_lock:
+                center = self.latest_center
+                new_target = self.has_new_target
+                self.has_new_target = False
+
+            if self.tracking_enabled and new_target and center is not None:
+                cx, cy = center
+
+                error_x = cx - self.FRAME_CENTER_X
+                error_y = cy - self.FRAME_CENTER_Y
+
+                if abs(error_x) < self.DEAD_ZONE_X:
+                    error_x = 0
+                if abs(error_y) < self.DEAD_ZONE_Y:
+                    error_y = 0
+
+                self.current_pan_angle -= error_x * self.KP_PAN
+                self.current_tilt_angle -= error_y * self.KP_TILT
+
+                self.current_pan_angle = max(self.PAN_MIN, min(self.PAN_MAX, self.current_pan_angle))
+                self.current_tilt_angle = max(self.TILT_MIN, min(self.TILT_MAX, self.current_tilt_angle))
+
+                self.last_detection_time = time.time()
+                self.set_servo_target(self.current_pan_angle, self.current_tilt_angle)
+
+            else:
+                time_since_detection = time.time() - self.last_detection_time
+
+                if self.tracking_enabled and (time_since_detection > self.DETECTION_TIMEOUT):
+                    pan_diff = 90.0 - self.current_pan_angle
+                    tilt_diff = 90.0 - self.current_tilt_angle
+
+                    if abs(pan_diff) > 0.5 or abs(tilt_diff) > 0.5:
+                        self.current_pan_angle += pan_diff * self.RECENTER_EASE
+                        self.current_tilt_angle += tilt_diff * self.RECENTER_EASE
+                        self.set_servo_target(self.current_pan_angle, self.current_tilt_angle)
+                    elif self.current_pan_angle != 90.0 or self.current_tilt_angle != 90.0:
+                        self.current_pan_angle = 90.0
+                        self.current_tilt_angle = 90.0
+                        self.set_servo_target(90, 90)
+
+            time.sleep(0.033)  # ~30 Hz
+
     def start(self):
-        if self.is_running:
+        if self.running:
             return
-        self.is_running = True
-        self.is_paused = False
-
-        # Register detection callback
-        self.detection_stream.on_detect_all(self._detection_callback)
-
-        # Start servo thread
-        self.servo_thread = threading.Thread(target=self._servo_control_loop, daemon=True)
+        self.running = True
+        self.paused = False
+        self.servo_thread = threading.Thread(target=self.servo_control_loop, daemon=True)
         self.servo_thread.start()
-
-        print("[ObjDetect] Started.")
+        print("[ObjectDetect] Started.")
 
     def pause(self):
-        """Pause object detection (for currency detection)."""
-        self.is_paused = True
-        print("[ObjDetect] Paused.")
+        self.paused = True
+        print("[ObjectDetect] Paused.")
 
     def resume(self):
-        """Resume object detection."""
-        self.is_paused = False
+        self.paused = False
         self.last_detection_time = time.time()
-        print("[ObjDetect] Resumed.")
+        print("[ObjectDetect] Resumed.")
 
     def stop(self):
-        self.is_running = False
-        print("[ObjDetect] Stopped.")
-
-    def get_status(self):
-        return {
-            "running": self.is_running,
-            "paused": self.is_paused,
-            "tracking": self.tracking_enabled,
-            "locked_label": self.locked_label
-        }
+        self.running = False
+        print("[ObjectDetect] Stopped.")
 
 # ============================================================
-# Currency Detection
+# Instantiate Object Detection Manager
 # ============================================================
-class CurrencyDetector:
-    def __init__(self, confidence_threshold=0.5):
-        self.classifier = VideoImageClassification(confidence=confidence_threshold, debounce_sec=0.0)
-        self.confidence_threshold = confidence_threshold
-        self.is_running = False
-        self.last_label = None
-        self.detection_start_time = None
-        self.detection_duration = 2.0
-        self.callback = None
-        self.obj_detection_manager = None
-
-        def process_wrapper(classifications):
-            self._process_results(classifications)
-
-        self.classifier.on_detect_all(process_wrapper)
-        print("[Currency] Detector ready.")
-
-    def set_object_detection_manager(self, manager):
-        self.obj_detection_manager = manager
-
-    def start(self, callback=None):
-        if self.is_running:
-            print("[Currency] Already running.")
-            return
-        # ---- Pause object detection ----
-        if self.obj_detection_manager:
-            self.obj_detection_manager.pause()
-
-        self.is_running = True
-        self.callback = callback
-        self.last_label = None
-        self.detection_start_time = None
-        print("[Currency] Detection started. Hold note in front of camera.")
-
-    def stop(self):
-        self.is_running = False
-        self.last_label = None
-        self.detection_start_time = None
-        # ---- Resume object detection ----
-        if self.obj_detection_manager:
-            self.obj_detection_manager.resume()
-        print("[Currency] Detection stopped.")
-
-    def _process_results(self, classifications: dict):
-        if not self.is_running:
-            return
-
-        if not classifications:
-            self.last_label = None
-            self.detection_start_time = None
-            return
-
-        best_label = None
-        best_confidence = 0
-        for label, confidence in classifications.items():
-            if confidence > best_confidence:
-                best_confidence = confidence
-                best_label = label
-
-        if best_confidence < self.confidence_threshold:
-            self.last_label = None
-            self.detection_start_time = None
-            return
-
-        now = time.time()
-
-        if best_label == self.last_label:
-            if self.detection_start_time is None:
-                self.detection_start_time = now
-                print(f"[Currency] First detection: {best_label} ({best_confidence:.2f})")
-            elif now - self.detection_start_time >= self.detection_duration:
-                print(f"[Currency] CONFIRMED: {best_label}")
-                self.is_running = False
-                self.last_label = None
-                self.detection_start_time = None
-                # ---- Resume object detection ----
-                if self.obj_detection_manager:
-                    self.obj_detection_manager.resume()
-                if self.callback:
-                    self.callback(best_label)
-        else:
-            self.last_label = best_label
-            self.detection_start_time = now
-            print(f"[Currency] New label: {best_label} ({best_confidence:.2f})")
+object_detector = ObjectDetectionManager(camera=shared_camera)
+object_detector.start()
 
 # ============================================================
-# Initialize Object Detection Manager
+# Mode Management Functions
 # ============================================================
-obj_detection = ObjectDetectionManager(ui)
-obj_detection.start()
-print("[Main] Object detection started.")
+def pause_object_detection():
+    object_detector.pause()
+    print("[Mode] Object detection paused.")
+
+def resume_object_detection():
+    object_detector.resume()
+    print("[Mode] Object detection resumed.")
 
 # ============================================================
-# Initialize Currency Detector (with reference to object detection)
-# ============================================================
-currency_detector = CurrencyDetector(confidence_threshold=0.70)
-currency_detector.set_object_detection_manager(obj_detection)
-
-def on_currency_detected(label):
-    print(f"[Currency] CONFIRMED: {label}")
-    speak(f"This is a {label} note")
-
-# ============================================================
-# WebSocket Handlers
+# WebSocket Handlers (Existing)
 # ============================================================
 def on_raw_text(sid, message):
     print(f"\n[Raw Text] Client {sid} sent: {message}")
@@ -420,26 +490,24 @@ def on_gps(sid, message):
             data = json.loads(message)
         else:
             data = message
+
         lat = float(data.get("lat", 0))
         lng = float(data.get("lng", 0))
+
         with gps_lock:
             gps_data["lat"] = lat
             gps_data["lng"] = lng
             gps_data["fix"] = True
             gps_data["last_update"] = time.time()
+
         print(f"\n[GPS] {sid} -> Lat: {lat:.6f}, Lng: {lng:.6f}")
         lat2 = lat
         lng2 = lng
+
     except json.JSONDecodeError:
         print(f"\n[GPS] Invalid JSON from {sid}: {message}")
     except Exception as e:
         print(f"\n[GPS] Error: {e}")
-
-# ============================================================
-# Register WebUI Handlers
-# ============================================================
-ui.on_message("raw_text", on_raw_text)
-ui.on_message("gps", on_gps)
 
 # ============================================================
 # Ultrasonic Handler
@@ -464,17 +532,19 @@ def on_ultrasonic(data):
 Bridge.provide("ultrasonic", on_ultrasonic)
 
 # ============================================================
-# Obstacle Monitoring Thread
+# Obstacle Monitoring
 # ============================================================
 def monitor_obstacles(update_interval=0.05):
     print("Obstacle monitor running (using Bridge.notify()).")
     prev_state = (-1, -1, -1)
+
     try:
         while True:
             with obstacle_lock:
                 left = obstacle_data["left"]
                 center = obstacle_data["center"]
                 right = obstacle_data["right"]
+
             if (left, center, right) != prev_state:
                 status = ""
                 status += "L" if left else "-"
@@ -483,12 +553,13 @@ def monitor_obstacles(update_interval=0.05):
                 timestamp = time.strftime("%H:%M:%S")
                 print(f"[{timestamp}] Obstacles: [{status}]")
                 prev_state = (left, center, right)
+
             time.sleep(update_interval)
     except KeyboardInterrupt:
         print("Obstacle monitor stopped.")
 
 # ============================================================
-# SOS and Multi-Purpose Button Handlers
+# SOS & Multi-Purpose Button Handlers
 # ============================================================
 def on_sos(state):
     if state == "sos":
@@ -499,9 +570,10 @@ def on_sos(state):
 def handle_voice_result(text):
     print(f"[Voice Result] {text}")
 
-    # ---- Currency detection ----
+    # ---- Currency Detection ----
     if "detect money" in text.lower() or "identify money" in text.lower():
         print("Starting currency detection...")
+        pause_object_detection()
         currency_detector.start(callback=on_currency_detected)
         return
 
@@ -516,7 +588,8 @@ def on_mul(state):
         if state == "long":
             print("Cancelling currency detection...")
             currency_detector.stop()
-            print("[Currency] Cancelled by user.")
+            resume_object_detection()
+            speak("Currency detection cancelled.")
         return
 
     # ---- Voice recognition ----
@@ -526,19 +599,28 @@ def on_mul(state):
     if state == "short":
         print("Starting voice recognition...")
         voice.start_recording(callback=handle_voice_result)
-    else:
+    else:  # long press
         print("Cancelling voice recognition...")
         voice.stop_recording()
 
+# ============================================================
+# Register RPC Handlers
+# ============================================================
 Bridge.provide("SOS", on_sos)
 Bridge.provide("Mul_Pur", on_mul)
+
+# ============================================================
+# WebUI Handlers
+# ============================================================
+ui.on_message("raw_text", on_raw_text)
+ui.on_message("gps", on_gps)
 
 # ============================================================
 # Main Entry Point
 # ============================================================
 def main():
     print("=" * 50)
-    print("Diya 2 – Full System")
+    print("Diya 2 – Navigation + Vision Assistant")
     print("=" * 50)
 
     obstacle_thread = threading.Thread(target=monitor_obstacles, daemon=True)
