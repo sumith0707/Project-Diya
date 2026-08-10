@@ -17,6 +17,7 @@ from arduino.app_bricks.web_ui import WebUI
 from arduino.app_bricks.video_imageclassification import VideoImageClassification
 from arduino.app_bricks.video_objectdetection import VideoObjectDetection
 from arduino.app_peripherals.camera import Camera
+# from face_recognition_manager import FaceRecognitionManager
 from osm_nav import OsmNavigationEngine
 from emergency_manager import EmergencyManager
 from voice_recognition import VoiceRecognition
@@ -114,7 +115,7 @@ except Exception as e:
 # Currency Detector (Existing – Unchanged, now uses shared camera)
 # ============================================================
 class CurrencyDetector:
-    def __init__(self, confidence_threshold=0.5, camera=None):
+    def __init__(self, confidence_threshold=0.7, camera=None):
         # The brick itself is NOT constructed here. It's created fresh each
         # time currency-detection mode starts, and torn down when it ends,
         # so the classification runner only receives frames and runs
@@ -228,13 +229,32 @@ def on_currency_detected(label):
     resume_object_detection()
 
 # ============================================================
+# Face Recognition (offline, runs continuously in the background)
+# ============================================================
+# face_recognizer = FaceRecognitionManager(camera=shared_camera)
+
+# def on_person_recognized(name):
+#     print(f"[FaceRecog] Recognized: {name}")
+#     speak(f"{name} is approaching")
+
+# def on_enrollment_done(name, success):
+#     if success:
+#         speak(f"Got it. I'll remember {name}.")
+#     else:
+#         speak(f"I couldn't get a clear look. Let's try enrolling {name} again.")
+
+# face_recognizer.on_recognized(on_person_recognized)
+# face_recognizer.on_enrollment_done(on_enrollment_done)
+# face_recognizer.start()
+
+# ============================================================
 # OBJECT DETECTION MANAGER (Merged from test project, now uses shared camera)
 # ============================================================
 class ObjectDetectionManager:
     def __init__(self, camera=None):
         self.detection_stream = VideoObjectDetection(
             camera=camera,
-            confidence=0.2,
+            confidence=0.7,
             debounce_sec=0.0,
         )
 
@@ -344,32 +364,36 @@ class ObjectDetectionManager:
             if detections and self.locked_label in detections:
                 best_dist = float('inf')
                 for det in detections[self.locked_label]:
-                    bbox = det.get("bounding_box_xyxy", [0, 0, 0, 0])
-                    if bbox != [0, 0, 0, 0] and len(bbox) >= 4:
+                    bbox = det.get("bounding_box_xyxy", (0, 0, 0, 0))
+                    # ---- CORRECTED VALIDATION ----
+                    if len(bbox) == 4 and not all(v == 0 for v in bbox):
                         x1, y1, x2, y2 = bbox
-                        cx = (x1 + x2) / 2.0
-                        cy = (y1 + y2) / 2.0
-                        dist = ((cx - self.FRAME_CENTER_X) ** 2 + (cy - self.FRAME_CENTER_Y) ** 2) ** 0.5
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_center = (cx, cy)
+                        if (x2 - x1) > 10 and (y2 - y1) > 10:
+                            cx = (x1 + x2) / 2.0
+                            cy = (y1 + y2) / 2.0
+                            dist = ((cx - self.FRAME_CENTER_X) ** 2 + (cy - self.FRAME_CENTER_Y) ** 2) ** 0.5
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_center = (cx, cy)
         else:
             if detections:
                 highest_conf = -1.0
                 selected_label = None
                 selected_center = None
-
+    
                 for label, values in detections.items():
                     for det in values:
                         conf = det.get("confidence", 0.0) or 0.0
-                        bbox = det.get("bounding_box_xyxy", [0, 0, 0, 0])
-                        if bbox != [0, 0, 0, 0] and len(bbox) >= 4:
-                            if conf > highest_conf:
-                                highest_conf = conf
-                                selected_label = label
-                                x1, y1, x2, y2 = bbox
-                                selected_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
-
+                        bbox = det.get("bounding_box_xyxy", (0, 0, 0, 0))
+                        # ---- CORRECTED VALIDATION + MIN CONFIDENCE ----
+                        if len(bbox) == 4 and not all(v == 0 for v in bbox):
+                            x1, y1, x2, y2 = bbox
+                            if (x2 - x1) > 10 and (y2 - y1) > 10:
+                                if conf > highest_conf and conf > 0.3:
+                                    highest_conf = conf
+                                    selected_label = label
+                                    selected_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+    
                 if selected_label is not None:
                     self.locked_label = selected_label
                     self.lock_start_time = now
@@ -377,11 +401,53 @@ class ObjectDetectionManager:
                     print(f"[ObjectDetect] Locked onto '{self.locked_label}' (Conf: {highest_conf:.2f}) for 5s.")
             else:
                 self.locked_label = None
-
+    
         with self.target_lock:
             if best_center is not None:
                 self.latest_center = best_center
                 self.has_new_target = True
+        # if lock_active:
+        #     if detections and self.locked_label in detections:
+        #         best_dist = float('inf')
+        #         for det in detections[self.locked_label]:
+        #             bbox = det.get("bounding_box_xyxy", [0, 0, 0, 0])
+        #             if bbox != [0, 0, 0, 0] and len(bbox) >= 4:
+        #                 x1, y1, x2, y2 = bbox
+        #                 cx = (x1 + x2) / 2.0
+        #                 cy = (y1 + y2) / 2.0
+        #                 dist = ((cx - self.FRAME_CENTER_X) ** 2 + (cy - self.FRAME_CENTER_Y) ** 2) ** 0.5
+        #                 if dist < best_dist:
+        #                     best_dist = dist
+        #                     best_center = (cx, cy)
+        # else:
+        #     if detections:
+        #         highest_conf = -1.0
+        #         selected_label = None
+        #         selected_center = None
+
+        #         for label, values in detections.items():
+        #             for det in values:
+        #                 conf = det.get("confidence", 0.0) or 0.0
+        #                 bbox = det.get("bounding_box_xyxy", [0, 0, 0, 0])
+        #                 if bbox != [0, 0, 0, 0] and len(bbox) >= 4:
+        #                     if conf > highest_conf:
+        #                         highest_conf = conf
+        #                         selected_label = label
+        #                         x1, y1, x2, y2 = bbox
+        #                         selected_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+        #         if selected_label is not None:
+        #             self.locked_label = selected_label
+        #             self.lock_start_time = now
+        #             best_center = selected_center
+        #             print(f"[ObjectDetect] Locked onto '{self.locked_label}' (Conf: {highest_conf:.2f}) for 5s.")
+        #     else:
+        #         self.locked_label = None
+
+        # with self.target_lock:
+        #     if best_center is not None:
+        #         self.latest_center = best_center
+        #         self.has_new_target = True
 
     def servo_control_loop(self):
         while self.running:
@@ -576,6 +642,18 @@ def handle_voice_result(text):
         pause_object_detection()
         currency_detector.start(callback=on_currency_detected)
         return
+
+    # ---- Face Enrollment ----
+    # lowered = text.lower()
+    # for trigger in ("remember this person as ", "remember them as ", "enroll "):
+    #     if trigger in lowered:
+    #         name = text[lowered.index(trigger) + len(trigger):].strip().title()
+    #         if name:
+    #             speak(f"Okay, look at the camera. Enrolling {name}.")
+    #             face_recognizer.start_enrollment(name)
+    #         else:
+    #             speak("I didn't catch the name. Please try again.")
+    #         return
 
     # ---- Unknown command ----
     speak("I didn't understand that command.")
