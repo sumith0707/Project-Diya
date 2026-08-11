@@ -1,6 +1,6 @@
 #include <Arduino_RouterBridge.h>
 #include <OneButton.h>
-#include <SWI2C.h>
+#include <Wire.h>
 #include <Servo.h>
 
 // ============================================================
@@ -25,18 +25,17 @@ float target_tilt = 90.0;
 int last_written_pan = -1;
 int last_written_tilt = -1;
 
-const float EASE_FACTOR = 0.30;
+// time-based ease (per-second rate), replaces per-loop-iteration factor
+const float EASE_RATE = 8.0; // deg/sec convergence speed, tune as needed
+unsigned long lastServoUpdate = 0;
 
 void onServoCommand(String data);
 
 // ============================================================
-// SWI2C CONFIGURATION
+// I2C CONFIGURATION (hardware Wire2, A4/A5 on Uno Q)
+// NOTE: confirmed via scanner — on this Uno Q unit, A4/A5 map to Wire2.
 // ============================================================
-#define SDA_PIN A4
-#define SCL_PIN A5
 #define MPU6050_ADDR 0x68
-
-SWI2C mpu(SDA_PIN, SCL_PIN, MPU6050_ADDR);
 
 // ============================================================
 // MPU6050 REGISTERS
@@ -137,7 +136,7 @@ void setup() {
 
   // ---- MPU6050 ----
   if (initMPU6050()) {
-    Serial.println("MPU6050 ready (SWI2C).");
+    Serial.println("MPU6050 ready (hardware I2C).");
     readMPU6050();
   } else {
     Serial.println("MPU6050 not found!");
@@ -160,6 +159,7 @@ void setup() {
   Bridge.provide("get_heading", getIMUHeading);
   Bridge.provide("get_accel", getAccelerometer);
   Bridge.provide("servo", onServoCommand);
+  Serial.println("RPC handlers registered.");
 
   Serial.println("MCU ready: Interrupt ultrasonic + IMU + Servos + Buttons.");
 }
@@ -189,15 +189,24 @@ void loop() {
     sendUltrasonicData();
   }
 
-  // ---- Servo smoothing ----
+  // ---- Servo smoothing (time-based, immune to loop-rate jitter) ----
+  unsigned long nowMs = millis();
+  float dt = (lastServoUpdate == 0) ? 0.0 : (nowMs - lastServoUpdate) / 1000.0;
+  lastServoUpdate = nowMs;
+  if (dt > 0.1) dt = 0.1; // clamp huge gaps (e.g. after blocking op)
+
+  float step = EASE_RATE * dt;
+
   if (abs(target_pan - current_pan) > 0.5) {
-    current_pan += (target_pan - current_pan) * EASE_FACTOR;
+    float diff = target_pan - current_pan;
+    current_pan += constrain(diff, -step, step);
   } else {
     current_pan = target_pan;
   }
 
   if (abs(target_tilt - current_tilt) > 0.5) {
-    current_tilt += (target_tilt - current_tilt) * EASE_FACTOR;
+    float diff = target_tilt - current_tilt;
+    current_tilt += constrain(diff, -step, step);
   } else {
     current_tilt = target_tilt;
   }
@@ -310,26 +319,81 @@ int checkObstacle(int sensor_index) {
 }
 
 // ============================================================
-// MPU6050 FUNCTIONS
+// MPU6050 FUNCTIONS (hardware I2C via Wire)
 // ============================================================
+void mpuWriteReg(uint8_t reg, uint8_t val) {
+  Wire2.beginTransmission(MPU6050_ADDR);
+  Wire2.write(reg);
+  Wire2.write(val);
+  Wire2.endTransmission();
+}
+
 bool initMPU6050() {
-  mpu.begin();
+  Wire2.begin();
+  Wire2.setClock(100000); // 100kHz first — raise to 400k only once stable
   delay(100);
 
-  mpu.writeToRegister(MPU6050_PWR_MGMT_1, 0x00);
+  mpuWriteReg(MPU6050_PWR_MGMT_1, 0x00);
   delay(10);
-  mpu.writeToRegister(MPU6050_ACCEL_CONFIG, 0x10);
+  mpuWriteReg(MPU6050_ACCEL_CONFIG, 0x10);
   delay(10);
-  mpu.writeToRegister(MPU6050_GYRO_CONFIG, 0x08);
+  mpuWriteReg(MPU6050_GYRO_CONFIG, 0x08);
   delay(10);
+
+  // sanity check WHO_AM_I (should read 0x68)
+  Wire2.beginTransmission(MPU6050_ADDR);
+  Wire2.write(0x75);
+  uint8_t err = Wire2.endTransmission(); // plain STOP, no repeated start
+  if (err != 0) {
+    Serial.print("MPU WHO_AM_I write fail, err=");
+    Serial.println(err); // 1=data too long 2=addr NACK 3=data NACK 4=other/bus
+    imu_initialized = false;
+    return false;
+  }
+  Wire2.requestFrom((int)MPU6050_ADDR, 1);
+  if (Wire2.available() < 1) {
+    Serial.println("MPU WHO_AM_I no response.");
+    imu_initialized = false;
+    return false;
+  }
+  uint8_t whoami = Wire2.read();
+  Serial.print("MPU WHO_AM_I = 0x");
+  Serial.println(whoami, HEX); // expect 0x68
 
   imu_initialized = true;
   return true;
 }
 
+unsigned long mpuFailCount = 0;
+
 void readMPU6050() {
   uint8_t data[14];
-  mpu.readFromRegister(MPU6050_ACCEL_XOUT_H, data, 14);
+
+  Wire2.beginTransmission(MPU6050_ADDR);
+  Wire2.write(MPU6050_ACCEL_XOUT_H);
+  uint8_t err = Wire2.endTransmission(); // plain STOP, no repeated start
+  if (err != 0) {
+    mpuFailCount++;
+    if (mpuFailCount % 20 == 1) { // throttle spam
+      Serial.print("MPU read fail (write), err=");
+      Serial.println(err);
+    }
+    return;
+  }
+
+  uint8_t n = Wire2.requestFrom((int)MPU6050_ADDR, 14);
+  if (n < 14) {
+    mpuFailCount++;
+    if (mpuFailCount % 20 == 1) {
+      Serial.print("MPU read fail (short), got=");
+      Serial.println(n);
+    }
+    return;
+  }
+
+  for (int i = 0; i < 14; i++) {
+    data[i] = Wire2.read();
+  }
 
   int16_t ax = (int16_t)((data[0] << 8) | data[1]);
   int16_t ay = (int16_t)((data[2] << 8) | data[3]);
