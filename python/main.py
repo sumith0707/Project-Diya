@@ -17,7 +17,7 @@ from arduino.app_bricks.web_ui import WebUI
 from arduino.app_bricks.video_imageclassification import VideoImageClassification
 from arduino.app_bricks.video_objectdetection import VideoObjectDetection
 from arduino.app_peripherals.camera import Camera
-# from face_recognition_manager import FaceRecognitionManager
+from face_recognition_manager import FaceRecognitionManager
 from osm_nav import OsmNavigationEngine
 from emergency_manager import EmergencyManager
 from voice_recognition import VoiceRecognition
@@ -115,7 +115,7 @@ except Exception as e:
 # Currency Detector (Existing – Unchanged, now uses shared camera)
 # ============================================================
 class CurrencyDetector:
-    def __init__(self, confidence_threshold=0.7, camera=None):
+    def __init__(self, confidence_threshold=0.5, camera=None):
         # The brick itself is NOT constructed here. It's created fresh each
         # time currency-detection mode starts, and torn down when it ends,
         # so the classification runner only receives frames and runs
@@ -231,32 +231,46 @@ def on_currency_detected(label):
 # ============================================================
 # Face Recognition (offline, runs continuously in the background)
 # ============================================================
-# face_recognizer = FaceRecognitionManager(camera=shared_camera)
+face_recognizer = FaceRecognitionManager(camera=shared_camera)
 
-# def on_person_recognized(name):
-#     print(f"[FaceRecog] Recognized: {name}")
-#     speak(f"{name} is approaching")
+def on_person_recognized(name):
+    print(f"[FaceRecog] Recognized: {name}")
+    speak(f"{name} is approaching")
+    resume_object_detection()
 
-# def on_enrollment_done(name, success):
-#     if success:
-#         speak(f"Got it. I'll remember {name}.")
-#     else:
-#         speak(f"I couldn't get a clear look. Let's try enrolling {name} again.")
+def on_recognition_failed():
+    print("[FaceRecog] No match found for locked face.")
+    speak("I don't recognize this person.")
+    resume_object_detection()
 
-# face_recognizer.on_recognized(on_person_recognized)
-# face_recognizer.on_enrollment_done(on_enrollment_done)
-# face_recognizer.start()
+def on_enrollment_done(name, success):
+    if success:
+        speak(f"Got it. I'll remember {name}.")
+    else:
+        speak(f"I couldn't get a clear look. Let's try enrolling {name} again.")
+    resume_object_detection()
+
+face_recognizer.on_recognized(on_person_recognized)
+face_recognizer.on_recognition_failed(on_recognition_failed)
+face_recognizer.on_enrollment_done(on_enrollment_done)
+# Note: face_recognizer is NOT started here. It only runs on-demand -
+# triggered either by object detection locking onto a face for 5s
+# (see ObjectDetectionManager.on_face_locked below), or by voice-triggered
+# enrollment - never continuously in the background.
 
 # ============================================================
 # OBJECT DETECTION MANAGER (Merged from test project, now uses shared camera)
 # ============================================================
 class ObjectDetectionManager:
-    def __init__(self, camera=None):
-        self.detection_stream = VideoObjectDetection(
-            camera=camera,
-            confidence=0.7,
-            debounce_sec=0.0,
-        )
+    def __init__(self, camera=None, confidence=0.7):
+        # The brick is NOT constructed here - it's built fresh whenever
+        # object detection is active, and fully torn down (not just
+        # ignored) whenever it's paused, so its camera streaming + EI
+        # inference genuinely stop competing for CPU with currency
+        # detection, face recognition, and voice recording.
+        self.camera = camera
+        self.confidence = confidence
+        self.detection_stream = None
 
         # Frame & Servo Boundaries
         self.FRAME_WIDTH = 640
@@ -287,6 +301,12 @@ class ObjectDetectionManager:
         self.locked_label = None
         self.lock_start_time = 0.0
 
+        # Fires once when a 'face' lock has stayed active for the full
+        # LOCK_DURATION uninterrupted - see send_detections_to_ui(). Set
+        # from main.py.
+        self.on_face_locked = None
+        self.face_lock_notified = False
+
         # Threading
         self.latest_center = None
         self.has_new_target = False
@@ -302,15 +322,46 @@ class ObjectDetectionManager:
         self.last_sent_pan = -1
         self.last_sent_tilt = -1
 
-        # ========== FIX: Use a wrapper function for the callback ==========
+        self._build_stream()
+
+    def _build_stream(self):
+        """Construct and start the VideoObjectDetection brick. No-op if
+        already built."""
+        if self.detection_stream is not None:
+            return
+
+        self.detection_stream = VideoObjectDetection(
+            camera=self.camera,
+            confidence=self.confidence,
+            debounce_sec=0.0,
+        )
+
         def detection_wrapper(detections):
             self.send_detections_to_ui(detections)
 
         self.detection_stream.on_detect_all(detection_wrapper)
+        self.detection_stream.start()
+        print("[ObjectDetect] Detection stream built and started.")
+
+    def _teardown_stream(self):
+        """Fully stop and release the VideoObjectDetection brick."""
+        if self.detection_stream is None:
+            return
+        stream = self.detection_stream
+        self.detection_stream = None
+        try:
+            stream.stop()
+        except Exception as e:
+            print(f"[ObjectDetect] Error stopping detection stream: {e}")
+        print("[ObjectDetect] Detection stream stopped and released.")
 
     def on_override_threshold(self, sid, threshold):
+        self.confidence = float(threshold)  # remembered for the next (re)build too
+        if self.detection_stream is None:
+            print(f"[ObjectDetect] Threshold set to {threshold} (will apply once detection resumes).")
+            return
         try:
-            self.detection_stream.override_threshold(float(threshold))
+            self.detection_stream.override_threshold(self.confidence)
             print(f"[ObjectDetect] Threshold updated to {threshold}")
         except Exception as e:
             print(f"[ObjectDetect] Error: {e}")
@@ -365,7 +416,6 @@ class ObjectDetectionManager:
                 best_dist = float('inf')
                 for det in detections[self.locked_label]:
                     bbox = det.get("bounding_box_xyxy", (0, 0, 0, 0))
-                    # ---- CORRECTED VALIDATION ----
                     if len(bbox) == 4 and not all(v == 0 for v in bbox):
                         x1, y1, x2, y2 = bbox
                         if (x2 - x1) > 10 and (y2 - y1) > 10:
@@ -376,16 +426,23 @@ class ObjectDetectionManager:
                                 best_dist = dist
                                 best_center = (cx, cy)
         else:
+            # Lock window just ended (or was never active). If the lock we
+            # just held was 'face' for the entire window, that's a
+            # confirmed face-lock event - fire once.
+            if self.locked_label == "face" and not self.face_lock_notified:
+                self.face_lock_notified = True
+                if self.on_face_locked:
+                    self.on_face_locked()
+
             if detections:
                 highest_conf = -1.0
                 selected_label = None
                 selected_center = None
-    
+
                 for label, values in detections.items():
                     for det in values:
                         conf = det.get("confidence", 0.0) or 0.0
                         bbox = det.get("bounding_box_xyxy", (0, 0, 0, 0))
-                        # ---- CORRECTED VALIDATION + MIN CONFIDENCE ----
                         if len(bbox) == 4 and not all(v == 0 for v in bbox):
                             x1, y1, x2, y2 = bbox
                             if (x2 - x1) > 10 and (y2 - y1) > 10:
@@ -393,61 +450,21 @@ class ObjectDetectionManager:
                                     highest_conf = conf
                                     selected_label = label
                                     selected_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
-    
+
                 if selected_label is not None:
                     self.locked_label = selected_label
                     self.lock_start_time = now
+                    self.face_lock_notified = False
                     best_center = selected_center
                     print(f"[ObjectDetect] Locked onto '{self.locked_label}' (Conf: {highest_conf:.2f}) for 5s.")
             else:
                 self.locked_label = None
-    
+                self.face_lock_notified = False
+
         with self.target_lock:
             if best_center is not None:
                 self.latest_center = best_center
                 self.has_new_target = True
-        # if lock_active:
-        #     if detections and self.locked_label in detections:
-        #         best_dist = float('inf')
-        #         for det in detections[self.locked_label]:
-        #             bbox = det.get("bounding_box_xyxy", [0, 0, 0, 0])
-        #             if bbox != [0, 0, 0, 0] and len(bbox) >= 4:
-        #                 x1, y1, x2, y2 = bbox
-        #                 cx = (x1 + x2) / 2.0
-        #                 cy = (y1 + y2) / 2.0
-        #                 dist = ((cx - self.FRAME_CENTER_X) ** 2 + (cy - self.FRAME_CENTER_Y) ** 2) ** 0.5
-        #                 if dist < best_dist:
-        #                     best_dist = dist
-        #                     best_center = (cx, cy)
-        # else:
-        #     if detections:
-        #         highest_conf = -1.0
-        #         selected_label = None
-        #         selected_center = None
-
-        #         for label, values in detections.items():
-        #             for det in values:
-        #                 conf = det.get("confidence", 0.0) or 0.0
-        #                 bbox = det.get("bounding_box_xyxy", [0, 0, 0, 0])
-        #                 if bbox != [0, 0, 0, 0] and len(bbox) >= 4:
-        #                     if conf > highest_conf:
-        #                         highest_conf = conf
-        #                         selected_label = label
-        #                         x1, y1, x2, y2 = bbox
-        #                         selected_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
-
-        #         if selected_label is not None:
-        #             self.locked_label = selected_label
-        #             self.lock_start_time = now
-        #             best_center = selected_center
-        #             print(f"[ObjectDetect] Locked onto '{self.locked_label}' (Conf: {highest_conf:.2f}) for 5s.")
-        #     else:
-        #         self.locked_label = None
-
-        # with self.target_lock:
-        #     if best_center is not None:
-        #         self.latest_center = best_center
-        #         self.has_new_target = True
 
     def servo_control_loop(self):
         while self.running:
@@ -510,15 +527,20 @@ class ObjectDetectionManager:
 
     def pause(self):
         self.paused = True
-        print("[ObjectDetect] Paused.")
+        self.locked_label = None
+        self.face_lock_notified = False
+        self._teardown_stream()
+        print("[ObjectDetect] Paused (stream stopped).")
 
     def resume(self):
         self.paused = False
         self.last_detection_time = time.time()
-        print("[ObjectDetect] Resumed.")
+        self._build_stream()
+        print("[ObjectDetect] Resumed (stream restarted).")
 
     def stop(self):
         self.running = False
+        self._teardown_stream()
         print("[ObjectDetect] Stopped.")
 
 # ============================================================
@@ -537,6 +559,21 @@ def pause_object_detection():
 def resume_object_detection():
     object_detector.resume()
     print("[Mode] Object detection resumed.")
+
+# ============================================================
+# Face-Lock -> Face Recognition Trigger
+# ============================================================
+# When object detection has locked onto a 'face' for a full continuous 5s
+# window, pause object detection and run a bounded face-recognition
+# session. Whichever way that session ends (recognized or failed - see
+# on_person_recognized / on_recognition_failed above), object detection
+# resumes automatically.
+def on_face_locked():
+    print("[ObjectDetect] Face locked for 5s - switching to face recognition.")
+    pause_object_detection()
+    face_recognizer.start_recognition_session(timeout_sec=6.0)
+
+object_detector.on_face_locked = on_face_locked
 
 # ============================================================
 # WebSocket Handlers (Existing)
@@ -644,16 +681,17 @@ def handle_voice_result(text):
         return
 
     # ---- Face Enrollment ----
-    # lowered = text.lower()
-    # for trigger in ("remember this person as ", "remember them as ", "enroll "):
-    #     if trigger in lowered:
-    #         name = text[lowered.index(trigger) + len(trigger):].strip().title()
-    #         if name:
-    #             speak(f"Okay, look at the camera. Enrolling {name}.")
-    #             face_recognizer.start_enrollment(name)
-    #         else:
-    #             speak("I didn't catch the name. Please try again.")
-    #         return
+    lowered = text.lower()
+    for trigger in ("remember this face as ", "remember this person as ", "remember them as ", "enroll "):
+        if trigger in lowered:
+            name = text[lowered.index(trigger) + len(trigger):].strip().title()
+            if name:
+                speak(f"Okay, look at the camera. Enrolling {name}.")
+                pause_object_detection()
+                face_recognizer.start_enrollment(name)
+            else:
+                speak("I didn't catch the name. Please try again.")
+            return
 
     # ---- Unknown command ----
     speak("I didn't understand that command.")
@@ -676,10 +714,21 @@ def on_mul(state):
         return
     if state == "short":
         print("Starting voice recognition...")
-        voice.start_recording(callback=handle_voice_result)
+        pause_object_detection()
+
+        def on_voice_recognized(text):
+            # Resume as soon as speech is recognized. Whatever
+            # handle_voice_result does next (e.g. currency detection, face
+            # enrollment) is responsible for its own pause/resume around
+            # itself, same as before.
+            resume_object_detection()
+            handle_voice_result(text)
+
+        voice.start_recording(callback=on_voice_recognized)
     else:  # long press
         print("Cancelling voice recognition...")
         voice.stop_recording()
+        resume_object_detection()
 
 # ============================================================
 # Register RPC Handlers
