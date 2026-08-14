@@ -29,6 +29,15 @@ int last_written_tilt = -1;
 const float EASE_RATE = 8.0; // deg/sec convergence speed, tune as needed
 unsigned long lastServoUpdate = 0;
 
+// ---- Idle detach ----
+// If the servos have been sitting at rest (current == target, no new
+// command) for this long, release them so they stop drawing hold
+// current. They re-attach automatically the instant a new command
+// arrives via onServoCommand().
+bool servos_attached = true;
+unsigned long lastServoActivityMs = 0;
+const unsigned long IDLE_DETACH_MS = 5000; // 5s at rest before detaching
+
 void onServoCommand(String data);
 
 // ============================================================
@@ -153,6 +162,8 @@ void setup() {
   target_tilt = 90;
   last_written_pan = 90;
   last_written_tilt = 90;
+  servos_attached = true;
+  lastServoActivityMs = millis();
 
   // ---- RPC Callbacks ----
   Bridge.provide("ping", pingHandler);
@@ -196,10 +207,12 @@ void loop() {
   if (dt > 0.1) dt = 0.1; // clamp huge gaps (e.g. after blocking op)
 
   float step = EASE_RATE * dt;
+  bool isMoving = false;
 
   if (abs(target_pan - current_pan) > 0.5) {
     float diff = target_pan - current_pan;
     current_pan += constrain(diff, -step, step);
+    isMoving = true;
   } else {
     current_pan = target_pan;
   }
@@ -207,21 +220,40 @@ void loop() {
   if (abs(target_tilt - current_tilt) > 0.5) {
     float diff = target_tilt - current_tilt;
     current_tilt += constrain(diff, -step, step);
+    isMoving = true;
   } else {
     current_tilt = target_tilt;
   }
 
-  int target_pan_int = (int)constrain(round(current_pan), PAN_MIN, PAN_MAX);
-  int target_tilt_int = (int)constrain(round(current_tilt), TILT_MIN, TILT_MAX);
-
-  if (target_pan_int != last_written_pan) {
-    servo_pan.write(target_pan_int);
-    last_written_pan = target_pan_int;
+  if (isMoving) {
+    lastServoActivityMs = nowMs;
   }
 
-  if (target_tilt_int != last_written_tilt) {
-    servo_tilt.write(target_tilt_int);
-    last_written_tilt = target_tilt_int;
+  // Only touch the hardware if we're still attached (idle-detach below
+  // may have released it since the last loop).
+  if (servos_attached) {
+    int target_pan_int = (int)constrain(round(current_pan), PAN_MIN, PAN_MAX);
+    int target_tilt_int = (int)constrain(round(current_tilt), TILT_MIN, TILT_MAX);
+
+    if (target_pan_int != last_written_pan) {
+      servo_pan.write(target_pan_int);
+      last_written_pan = target_pan_int;
+    }
+
+    if (target_tilt_int != last_written_tilt) {
+      servo_tilt.write(target_tilt_int);
+      last_written_tilt = target_tilt_int;
+    }
+
+    // ---- Idle detach ----
+    // At rest (not moving) and no new command for IDLE_DETACH_MS ->
+    // release both servos so they stop drawing hold current.
+    if (!isMoving && (nowMs - lastServoActivityMs >= IDLE_DETACH_MS)) {
+      servo_pan.detach();
+      servo_tilt.detach();
+      servos_attached = false;
+      Serial.println("Servos idle - detached.");
+    }
   }
 }
 
@@ -448,6 +480,20 @@ void onServoCommand(String data) {
 
     target_pan = constrain(pan, PAN_MIN, PAN_MAX);
     target_tilt = constrain(tilt, TILT_MIN, TILT_MAX);
+
+    // A new command means activity — re-attach if we'd released the
+    // servos for being idle, and reset the idle clock either way.
+    if (!servos_attached) {
+      servo_pan.attach(PAN_PIN);
+      servo_tilt.attach(TILT_PIN);
+      servos_attached = true;
+      // Force a rewrite next loop since attach() doesn't guarantee the
+      // servo is already sitting at last_written_pan/tilt.
+      last_written_pan = -1;
+      last_written_tilt = -1;
+      Serial.println("Servos re-attached.");
+    }
+    lastServoActivityMs = millis();
   }
 }
 

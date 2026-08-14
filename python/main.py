@@ -39,7 +39,6 @@ except Exception as e:
     tts = None
 
 def speak(text):
-    """Helper to speak text via TTS."""
     if tts is None:
         print(f"[TTS] Not available: {text}")
         return
@@ -52,15 +51,37 @@ def speak(text):
 ui = WebUI()
 
 # ============================================================
-# Shared Camera
+# Independent Camera Wrapper – prevents bricks from stopping the camera,
+# but forwards all other attributes (like resolution) to the real camera.
 # ============================================================
-# A single USBCamera instance shared by every video brick in this app.
-# VideoObjectDetection and VideoImageClassification each open their own
-# exclusive V4L2 capture session when no `camera` is passed in, and most
-# USB webcams only support one exclusive capture session at a time. Passing
-# the same USBCamera instance into both bricks avoids that contention.
+class IndependentCamera:
+    def __init__(self, camera):
+        self._camera = camera
+
+    def start(self):
+        # Do nothing – camera is already started
+        pass
+
+    def stop(self):
+        # Do nothing – camera stays running
+        pass
+
+    def capture(self):
+        return self._camera.capture()
+
+    def __getattr__(self, name):
+        # Forward any other attribute access to the real camera
+        return getattr(self._camera, name)
+
+# ============================================================
+# Shared Camera – started ONCE and never stopped by bricks
+# ============================================================
 shared_camera = Camera(source=0, resolution=(640, 480), fps=10)
 shared_camera.start()
+print("[Main] Shared camera started (will stay running).")
+
+# Wrap it so bricks cannot stop it, but still get attributes like resolution
+camera_for_bricks = IndependentCamera(shared_camera)
 
 # ============================================================
 # Navigation Engine
@@ -112,14 +133,10 @@ except Exception as e:
     voice = None
 
 # ============================================================
-# Currency Detector (Existing – Unchanged, now uses shared camera)
+# Currency Detector
 # ============================================================
 class CurrencyDetector:
     def __init__(self, confidence_threshold=0.5, camera=None):
-        # The brick itself is NOT constructed here. It's created fresh each
-        # time currency-detection mode starts, and torn down when it ends,
-        # so the classification runner only receives frames and runs
-        # inference while this mode is actually active.
         self.camera = camera
         self.confidence_threshold = confidence_threshold
         self.classifier = None
@@ -134,20 +151,15 @@ class CurrencyDetector:
         if self.is_running:
             print("[Currency] Already running.")
             return
-
-        # Construct the brick on demand.
         self.classifier = VideoImageClassification(
             camera=self.camera,
             confidence=self.confidence_threshold,
             debounce_sec=0.0,
         )
-
         def process_wrapper(classifications):
             self._process_results(classifications)
-
         self.classifier.on_detect_all(process_wrapper)
         self.classifier.start()
-
         self.is_running = True
         self.callback = callback
         self.last_label = None
@@ -158,7 +170,6 @@ class CurrencyDetector:
         self.is_running = False
         self.last_label = None
         self.detection_start_time = None
-
         if self.classifier is not None:
             classifier_to_stop = self.classifier
             self.classifier = None
@@ -166,16 +177,9 @@ class CurrencyDetector:
                 classifier_to_stop.stop()
             except Exception as e:
                 print(f"[Currency] Error stopping classifier: {e}")
-
         print("[Currency] Detection stopped.")
 
     def _stop_async(self):
-        """Tear down the classifier from a separate thread.
-
-        Used when triggered from inside the classifier's own callback
-        (see _process_results) to avoid the callback thread blocking on
-        its own brick's stop()/join() call.
-        """
         threading.Thread(target=self.stop, daemon=True).start()
 
     def _process_results(self, classifications: dict):
@@ -211,8 +215,6 @@ class CurrencyDetector:
                 self.last_label = None
                 self.detection_start_time = None
                 callback = self.callback
-                # Tear down the brick asynchronously - we're currently
-                # running inside its own callback thread.
                 self._stop_async()
                 if callback:
                     callback(best_label)
@@ -221,7 +223,7 @@ class CurrencyDetector:
             self.detection_start_time = now
             print(f"[Currency] New label: {best_label} ({best_confidence:.2f})")
 
-currency_detector = CurrencyDetector(confidence_threshold=0.70, camera=shared_camera)
+currency_detector = CurrencyDetector(confidence_threshold=0.70, camera=camera_for_bricks)
 
 def on_currency_detected(label):
     print(f"[Currency] CONFIRMED: {label}")
@@ -229,45 +231,36 @@ def on_currency_detected(label):
     resume_object_detection()
 
 # ============================================================
-# Face Recognition (offline, runs continuously in the background)
+# Face Recognition
 # ============================================================
-face_recognizer = FaceRecognitionManager(camera=shared_camera)
+face_recognizer = FaceRecognitionManager(camera=camera_for_bricks)
 
 def on_person_recognized(name):
     print(f"[FaceRecog] Recognized: {name}")
     speak(f"{name} is approaching")
-    resume_object_detection()
+    object_detector.unsuppress()
 
 def on_recognition_failed():
     print("[FaceRecog] No match found for locked face.")
     speak("I don't recognize this person.")
-    resume_object_detection()
+    object_detector.unsuppress()
 
 def on_enrollment_done(name, success):
     if success:
         speak(f"Got it. I'll remember {name}.")
     else:
         speak(f"I couldn't get a clear look. Let's try enrolling {name} again.")
-    resume_object_detection()
+    object_detector.unsuppress()
 
 face_recognizer.on_recognized(on_person_recognized)
 face_recognizer.on_recognition_failed(on_recognition_failed)
 face_recognizer.on_enrollment_done(on_enrollment_done)
-# Note: face_recognizer is NOT started here. It only runs on-demand -
-# triggered either by object detection locking onto a face for 5s
-# (see ObjectDetectionManager.on_face_locked below), or by voice-triggered
-# enrollment - never continuously in the background.
 
 # ============================================================
-# OBJECT DETECTION MANAGER (Merged from test project, now uses shared camera)
+# OBJECT DETECTION MANAGER
 # ============================================================
 class ObjectDetectionManager:
     def __init__(self, camera=None, confidence=0.7):
-        # The brick is NOT constructed here - it's built fresh whenever
-        # object detection is active, and fully torn down (not just
-        # ignored) whenever it's paused, so its camera streaming + EI
-        # inference genuinely stop competing for CPU with currency
-        # detection, face recognition, and voice recording.
         self.camera = camera
         self.confidence = confidence
         self.detection_stream = None
@@ -301,11 +294,10 @@ class ObjectDetectionManager:
         self.locked_label = None
         self.lock_start_time = 0.0
 
-        # Fires once when a 'face' lock has stayed active for the full
-        # LOCK_DURATION uninterrupted - see send_detections_to_ui(). Set
-        # from main.py.
-        self.on_face_locked = None
-        self.face_lock_notified = False
+        # Suppression – used while face recognition/enrollment runs.
+        # Keeps the detection stream (and camera feed to the WebUI) alive,
+        # but stops publishing detections and stops servo tracking.
+        self.suppressed = False
 
         # Threading
         self.latest_center = None
@@ -325,13 +317,11 @@ class ObjectDetectionManager:
         self._build_stream()
 
     def _build_stream(self):
-        """Construct and start the VideoObjectDetection brick. No-op if
-        already built."""
         if self.detection_stream is not None:
             return
 
         self.detection_stream = VideoObjectDetection(
-            camera=self.camera,
+            camera=self.camera,          # wrapper – won't stop the camera, but exposes resolution
             confidence=self.confidence,
             debounce_sec=0.0,
         )
@@ -342,21 +332,23 @@ class ObjectDetectionManager:
         self.detection_stream.on_detect_all(detection_wrapper)
         self.detection_stream.start()
         print("[ObjectDetect] Detection stream built and started.")
+        # Notify WebUI to reload the iframe
+        ui.send_message("reload_stream", {})
 
     def _teardown_stream(self):
-        """Fully stop and release the VideoObjectDetection brick."""
         if self.detection_stream is None:
             return
         stream = self.detection_stream
         self.detection_stream = None
         try:
+            # Stop the brick – the camera wrapper will prevent it from stopping the real camera
             stream.stop()
         except Exception as e:
             print(f"[ObjectDetect] Error stopping detection stream: {e}")
         print("[ObjectDetect] Detection stream stopped and released.")
 
     def on_override_threshold(self, sid, threshold):
-        self.confidence = float(threshold)  # remembered for the next (re)build too
+        self.confidence = float(threshold)
         if self.detection_stream is None:
             print(f"[ObjectDetect] Threshold set to {threshold} (will apply once detection resumes).")
             return
@@ -376,11 +368,8 @@ class ObjectDetectionManager:
             self.set_servo_target(90, 90)
 
     def set_servo_target(self, pan, tilt):
-        # Convert float angles to rounded integers
         pan = max(self.PAN_MIN, min(self.PAN_MAX, int(round(pan))))
         tilt = max(self.TILT_MIN, min(self.TILT_MAX, int(round(tilt))))
-
-        # 2. MODIFY THIS: Only fire RPC when an actual degree step occurs
         if pan != self.last_sent_pan or tilt != self.last_sent_tilt:
             try:
                 Bridge.notify("servo", f"{pan},{tilt}")
@@ -390,14 +379,14 @@ class ObjectDetectionManager:
                 print(f"[ObjectDetect] Servo error: {e}")
 
     def send_detections_to_ui(self, detections: dict):
-        # If paused, ignore detections
-        if self.paused:
+        # While paused (stream torn down) or suppressed (stream alive but
+        # output/tracking silenced for face recognition) do nothing.
+        if self.paused or self.suppressed:
             return
 
         best_center = None
         now = time.time()
 
-        # Forward raw detections to WebUI
         if detections:
             for key, values in detections.items():
                 for value in values:
@@ -408,7 +397,6 @@ class ObjectDetectionManager:
                     }
                     ui.send_message("detection", message=entry)
 
-        # Target Selection with 5-Second Lock
         lock_active = (self.locked_label is not None) and ((now - self.lock_start_time) < self.LOCK_DURATION)
 
         if lock_active:
@@ -426,14 +414,6 @@ class ObjectDetectionManager:
                                 best_dist = dist
                                 best_center = (cx, cy)
         else:
-            # Lock window just ended (or was never active). If the lock we
-            # just held was 'face' for the entire window, that's a
-            # confirmed face-lock event - fire once.
-            if self.locked_label == "face" and not self.face_lock_notified:
-                self.face_lock_notified = True
-                if self.on_face_locked:
-                    self.on_face_locked()
-
             if detections:
                 highest_conf = -1.0
                 selected_label = None
@@ -454,12 +434,10 @@ class ObjectDetectionManager:
                 if selected_label is not None:
                     self.locked_label = selected_label
                     self.lock_start_time = now
-                    self.face_lock_notified = False
                     best_center = selected_center
                     print(f"[ObjectDetect] Locked onto '{self.locked_label}' (Conf: {highest_conf:.2f}) for 5s.")
             else:
                 self.locked_label = None
-                self.face_lock_notified = False
 
         with self.target_lock:
             if best_center is not None:
@@ -468,7 +446,6 @@ class ObjectDetectionManager:
 
     def servo_control_loop(self):
         while self.running:
-            # If paused, skip updating servos
             if self.paused:
                 time.sleep(0.05)
                 continue
@@ -478,9 +455,8 @@ class ObjectDetectionManager:
                 new_target = self.has_new_target
                 self.has_new_target = False
 
-            if self.tracking_enabled and new_target and center is not None:
+            if self.tracking_enabled and not self.suppressed and new_target and center is not None:
                 cx, cy = center
-
                 error_x = cx - self.FRAME_CENTER_X
                 error_y = cy - self.FRAME_CENTER_Y
 
@@ -501,7 +477,7 @@ class ObjectDetectionManager:
             else:
                 time_since_detection = time.time() - self.last_detection_time
 
-                if self.tracking_enabled and (time_since_detection > self.DETECTION_TIMEOUT):
+                if self.tracking_enabled and not self.suppressed and (time_since_detection > self.DETECTION_TIMEOUT):
                     pan_diff = 90.0 - self.current_pan_angle
                     tilt_diff = 90.0 - self.current_tilt_angle
 
@@ -514,7 +490,7 @@ class ObjectDetectionManager:
                         self.current_tilt_angle = 90.0
                         self.set_servo_target(90, 90)
 
-            time.sleep(0.033)  # ~30 Hz
+            time.sleep(0.033)
 
     def start(self):
         if self.running:
@@ -528,7 +504,6 @@ class ObjectDetectionManager:
     def pause(self):
         self.paused = True
         self.locked_label = None
-        self.face_lock_notified = False
         self._teardown_stream()
         print("[ObjectDetect] Paused (stream stopped).")
 
@@ -538,6 +513,24 @@ class ObjectDetectionManager:
         self._build_stream()
         print("[ObjectDetect] Resumed (stream restarted).")
 
+    def suppress(self):
+        # Stream keeps running (camera feed to WebUI stays alive), but
+        # output is dropped and the servo stops moving / recenters.
+        self.suppressed = True
+        self.locked_label = None
+        with self.target_lock:
+            self.latest_center = None
+            self.has_new_target = False
+        self.current_pan_angle = 90.0
+        self.current_tilt_angle = 90.0
+        self.set_servo_target(90, 90)
+        print("[ObjectDetect] Suppressed (stream stays alive).")
+
+    def unsuppress(self):
+        self.suppressed = False
+        self.last_detection_time = time.time()
+        print("[ObjectDetect] Unsuppressed.")
+
     def stop(self):
         self.running = False
         self._teardown_stream()
@@ -546,11 +539,11 @@ class ObjectDetectionManager:
 # ============================================================
 # Instantiate Object Detection Manager
 # ============================================================
-object_detector = ObjectDetectionManager(camera=shared_camera)
+object_detector = ObjectDetectionManager(camera=camera_for_bricks)
 object_detector.start()
 
 # ============================================================
-# Mode Management Functions
+# Mode Management
 # ============================================================
 def pause_object_detection():
     object_detector.pause()
@@ -558,25 +551,11 @@ def pause_object_detection():
 
 def resume_object_detection():
     object_detector.resume()
+    # Additional reload event is sent inside _build_stream()
     print("[Mode] Object detection resumed.")
 
 # ============================================================
-# Face-Lock -> Face Recognition Trigger
-# ============================================================
-# When object detection has locked onto a 'face' for a full continuous 5s
-# window, pause object detection and run a bounded face-recognition
-# session. Whichever way that session ends (recognized or failed - see
-# on_person_recognized / on_recognition_failed above), object detection
-# resumes automatically.
-def on_face_locked():
-    print("[ObjectDetect] Face locked for 5s - switching to face recognition.")
-    pause_object_detection()
-    face_recognizer.start_recognition_session(timeout_sec=6.0)
-
-object_detector.on_face_locked = on_face_locked
-
-# ============================================================
-# WebSocket Handlers (Existing)
+# WebSocket Handlers
 # ============================================================
 def on_raw_text(sid, message):
     print(f"\n[Raw Text] Client {sid} sent: {message}")
@@ -670,36 +649,50 @@ def on_sos(state):
     elif state == "sos_cancel":
         emergency.cancel_emergency()
 
+FACE_QUERY_PHRASES = (
+    "who's approaching",
+    "whos approaching",
+    "who is approaching",
+    "who's in front of me",
+    "whos in front of me",
+    "who is in front of me",
+    "who's infront of me",
+    "whos infront of me",
+    "who is infront of me",
+)
+
 def handle_voice_result(text):
     print(f"[Voice Result] {text}")
+    lowered = text.lower()
 
-    # ---- Currency Detection ----
-    if "detect money" in text.lower() or "identify money" in text.lower():
+    if "detect money" in lowered or "identify money" in lowered:
         print("Starting currency detection...")
         pause_object_detection()
         currency_detector.start(callback=on_currency_detected)
         return
 
-    # ---- Face Enrollment ----
-    lowered = text.lower()
+    if any(phrase in lowered for phrase in FACE_QUERY_PHRASES):
+        print("Starting face recognition (object detection suppressed, not paused)...")
+        object_detector.suppress()
+        face_recognizer.start_recognition_session(timeout_sec=6.0)
+        return
+
     for trigger in ("remember this face as ", "remember this person as ", "remember them as ", "enroll "):
         if trigger in lowered:
             name = text[lowered.index(trigger) + len(trigger):].strip().title()
             if name:
                 speak(f"Okay, look at the camera. Enrolling {name}.")
-                pause_object_detection()
+                object_detector.suppress()
                 face_recognizer.start_enrollment(name)
             else:
                 speak("I didn't catch the name. Please try again.")
             return
 
-    # ---- Unknown command ----
     speak("I didn't understand that command.")
 
 def on_mul(state):
     print(f"[Mul_Pur] Button pressed: {state}")
 
-    # ---- If currency detection is running, cancel it ----
     if currency_detector.is_running:
         if state == "long":
             print("Cancelling currency detection...")
@@ -708,7 +701,6 @@ def on_mul(state):
             speak("Currency detection cancelled.")
         return
 
-    # ---- Voice recognition ----
     if voice is None:
         print("Voice recognition not available.")
         return
@@ -717,10 +709,6 @@ def on_mul(state):
         pause_object_detection()
 
         def on_voice_recognized(text):
-            # Resume as soon as speech is recognized. Whatever
-            # handle_voice_result does next (e.g. currency detection, face
-            # enrollment) is responsible for its own pause/resume around
-            # itself, same as before.
             resume_object_detection()
             handle_voice_result(text)
 

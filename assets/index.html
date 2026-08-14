@@ -51,7 +51,6 @@
 </head>
 <body>
 <div class="container">
-    <!-- Header -->
     <div class="header">
         <h1>🎯 Diya 2 – Navigation & Vision</h1>
         <div class="header-controls">
@@ -62,19 +61,15 @@
         </div>
     </div>
 
-    <!-- Main Content -->
     <div class="main-content">
-        <!-- Video Feed -->
         <div class="video-container" id="video-container">
-            <div id="videoPlaceholder" class="camera-status" style="text-align:center;padding:40px;color:#888;">
+            <div id="videoPlaceholder" style="text-align:center;padding:40px;color:#888;">
                 <p>📷 Loading camera...</p>
             </div>
             <iframe id="dynamicIframe" title="Video stream" frameborder="0" style="display:none;width:100%;height:480px;border-radius:5px;background:#0f3460;"></iframe>
         </div>
 
-        <!-- Right Panel -->
         <div class="right-panel">
-            <!-- Confidence Slider -->
             <div class="panel controls-section">
                 <div class="panel-title">🎚️ Confidence</div>
                 <div class="control-group">
@@ -97,7 +92,6 @@
                 </div>
             </div>
 
-            <!-- Feedback -->
             <div class="panel">
                 <div class="panel-title">💬 Feedback</div>
                 <div id="feedback-content" class="feedback-content">
@@ -106,7 +100,6 @@
                 </div>
             </div>
 
-            <!-- Recent Detections -->
             <div class="panel">
                 <div class="panel-title">📋 Recent Detections</div>
                 <ul id="recentDetections" class="detections-list">
@@ -116,7 +109,6 @@
         </div>
     </div>
 
-    <!-- Input Area -->
     <div class="panel" style="margin-top:20px;">
         <div class="panel-title">⌨️ Send Command</div>
         <div class="input-area">
@@ -128,14 +120,10 @@
     </div>
 </div>
 
-<!-- ============================================================ -->
-<!-- Scripts -->
-<!-- ============================================================ -->
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script>
 const socket = io();
 
-// ---- Connection ----
 socket.on("connect", () => {
     console.log("Connected to server.");
 });
@@ -143,6 +131,57 @@ socket.on("connect", () => {
 socket.on("disconnect", () => {
     console.log("Disconnected.");
 });
+
+// ---- Video Stream Helpers ----
+const iframe = document.getElementById('dynamicIframe');
+const placeholder = document.getElementById('videoPlaceholder');
+
+// IMPORTANT: Change this port to match the one in your app.yaml for video_object_detection
+const targetPort = 4912;   // ← Update this!
+const targetPath = '/embed';
+const streamUrl = `http://${window.location.hostname}:${targetPort}${targetPath}`;
+
+let retryCount = 0;
+const MAX_RETRIES = 10;
+const RETRY_DELAY_MS = 1000;
+
+function startVideoLoading() {
+    placeholder.style.display = 'block';
+    iframe.style.display = 'none';
+    iframe.src = streamUrl;
+    retryCount = 0;
+}
+
+function retryVideoLoading() {
+    if (retryCount >= MAX_RETRIES) {
+        console.error("[WebUI] Failed to load video stream after maximum retries.");
+        placeholder.innerHTML = '<p>⚠️ Video stream unavailable. Please refresh.</p>';
+        return;
+    }
+    retryCount++;
+    console.log(`[WebUI] Retrying video load (attempt ${retryCount}/${MAX_RETRIES})...`);
+    setTimeout(() => {
+        iframe.src = streamUrl;
+    }, RETRY_DELAY_MS);
+}
+
+iframe.onload = () => {
+    placeholder.style.display = 'none';
+    iframe.style.display = 'block';
+    retryCount = 0;
+    console.log("[WebUI] Video stream loaded.");
+};
+
+iframe.onerror = () => {
+    retryVideoLoading();
+};
+
+socket.on("reload_stream", () => {
+    console.log("[WebUI] Reloading video stream...");
+    startVideoLoading();
+});
+
+startVideoLoading();
 
 // ---- Raw Text ----
 function sendText() {
@@ -164,30 +203,6 @@ socket.on("sos", (msg) => {
     el.style.display = "block";
     setTimeout(() => { el.style.display = "none"; }, 10000);
 });
-
-// ---- Video Feed ----
-(function initVideo() {
-    const iframe = document.getElementById('dynamicIframe');
-    const placeholder = document.getElementById('videoPlaceholder');
-    const currentHostname = window.location.hostname;
-    const targetPort = 4912;
-    const targetPath = '/embed';
-    const streamUrl = `http://${currentHostname}:${targetPort}${targetPath}`;
-
-    let intervalId;
-
-    iframe.onload = () => {
-        if (intervalId) clearInterval(intervalId);
-        placeholder.style.display = 'none';
-        iframe.style.display = 'block';
-    };
-
-    const startLoading = () => {
-        iframe.src = streamUrl;
-    };
-
-    intervalId = setInterval(startLoading, 1000);
-})();
 
 // ---- Confidence Slider ----
 const confidenceSlider = document.getElementById('confidenceSlider');
@@ -296,9 +311,6 @@ function updateFeedback(detection) {
         `;
     }
 }
-
-// ---- Detect Money from UI (optional) ----
-// You can add a button to trigger currency detection if needed
 </script>
 </body>
 </html>
