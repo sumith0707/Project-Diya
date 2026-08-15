@@ -124,7 +124,6 @@ try:
         device="cpu",
         compute_type="int8",
         block_duration_ms=30,
-        silence_timeout=1.5,
         vad_mode=1
     )
     print("Voice recognition engine ready (Faster Whisper tiny).")
@@ -276,10 +275,15 @@ class ObjectDetectionManager:
         self.TILT_MIN = 20
         self.TILT_MAX = 160
 
-        self.DEAD_ZONE_X = 25
-        self.DEAD_ZONE_Y = 25
-        self.KP_PAN = 0.04
-        self.KP_TILT = 0.04
+        self.DEAD_ZONE_X = 30
+        self.DEAD_ZONE_Y = 30
+        self.KP_PAN = 0.02
+        self.KP_TILT = 0.02
+
+        # Smoothing for jittery bbox centers (EMA low-pass filter)
+        self.SMOOTH_ALPHA = 0.4   # lower = smoother/slower, higher = snappier/noisier
+        self.smoothed_cx = None
+        self.smoothed_cy = None
 
         self.current_pan_angle = 90.0
         self.current_tilt_angle = 90.0
@@ -363,6 +367,8 @@ class ObjectDetectionManager:
         print(f"[ObjectDetect] Tracking {'enabled' if self.tracking_enabled else 'disabled'}.")
         if not self.tracking_enabled:
             self.locked_label = None
+            self.smoothed_cx = None
+            self.smoothed_cy = None
             self.current_pan_angle = 90.0
             self.current_tilt_angle = 90.0
             self.set_servo_target(90, 90)
@@ -438,6 +444,8 @@ class ObjectDetectionManager:
                     print(f"[ObjectDetect] Locked onto '{self.locked_label}' (Conf: {highest_conf:.2f}) for 5s.")
             else:
                 self.locked_label = None
+                self.smoothed_cx = None
+                self.smoothed_cy = None
 
         with self.target_lock:
             if best_center is not None:
@@ -456,7 +464,18 @@ class ObjectDetectionManager:
                 self.has_new_target = False
 
             if self.tracking_enabled and not self.suppressed and new_target and center is not None:
-                cx, cy = center
+                raw_cx, raw_cy = center
+
+                # EMA low-pass filter to smooth noisy bbox centers
+                if self.smoothed_cx is None:
+                    self.smoothed_cx = raw_cx
+                    self.smoothed_cy = raw_cy
+                else:
+                    self.smoothed_cx = (self.SMOOTH_ALPHA * raw_cx) + ((1 - self.SMOOTH_ALPHA) * self.smoothed_cx)
+                    self.smoothed_cy = (self.SMOOTH_ALPHA * raw_cy) + ((1 - self.SMOOTH_ALPHA) * self.smoothed_cy)
+
+                cx, cy = self.smoothed_cx, self.smoothed_cy
+
                 error_x = cx - self.FRAME_CENTER_X
                 error_y = cy - self.FRAME_CENTER_Y
 
@@ -504,6 +523,8 @@ class ObjectDetectionManager:
     def pause(self):
         self.paused = True
         self.locked_label = None
+        self.smoothed_cx = None
+        self.smoothed_cy = None
         self._teardown_stream()
         print("[ObjectDetect] Paused (stream stopped).")
 
@@ -518,6 +539,8 @@ class ObjectDetectionManager:
         # output is dropped and the servo stops moving / recenters.
         self.suppressed = True
         self.locked_label = None
+        self.smoothed_cx = None
+        self.smoothed_cy = None
         with self.target_lock:
             self.latest_center = None
             self.has_new_target = False
@@ -706,17 +729,20 @@ def on_mul(state):
         return
     if state == "short":
         print("Starting voice recognition...")
-        pause_object_detection()
+        object_detector.suppress()
 
         def on_voice_recognized(text):
-            resume_object_detection()
-            handle_voice_result(text)
+            # Always come out of suppression by default once recognition
+            # finishes; handle_voice_result() will re-suppress if the
+            # command itself needs the camera (face recognition/enroll).
+            object_detector.unsuppress()
+            if text:
+                handle_voice_result(text)
 
         voice.start_recording(callback=on_voice_recognized)
-    else:  # long press
+    else:  # long press – this is the ONLY way recording stops now
         print("Cancelling voice recognition...")
         voice.stop_recording()
-        resume_object_detection()
 
 # ============================================================
 # Register RPC Handlers
