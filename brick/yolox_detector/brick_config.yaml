@@ -1,0 +1,12 @@
+id: yolox_detector
+name: YOLOX Object Detector
+description: On-demand pretrained YOLOX object detection.
+category: video
+requires_container: true
+required_devices:
+  - camera
+variables:
+- name: BIND_ADDRESS
+  description: Bind address
+  hidden: true
+  default_value: 0.0.0.0

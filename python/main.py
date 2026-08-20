@@ -183,8 +183,10 @@ class CurrencyDetector:
 
     def _process_results(self, classifications: dict):
         if not self.is_running:
+            print("Not running")
             return
         if not classifications:
+            print("No classifications")
             self.last_label = None
             self.detection_start_time = None
             return
@@ -275,13 +277,13 @@ class ObjectDetectionManager:
         self.TILT_MIN = 20
         self.TILT_MAX = 160
 
-        self.DEAD_ZONE_X = 30
+        self.DEAD_ZONE_X = 40
         self.DEAD_ZONE_Y = 30
         self.KP_PAN = 0.02
         self.KP_TILT = 0.02
 
         # Smoothing for jittery bbox centers (EMA low-pass filter)
-        self.SMOOTH_ALPHA = 0.4   # lower = smoother/slower, higher = snappier/noisier
+        self.SMOOTH_ALPHA = 0.2   # lower = smoother/slower, higher = snappier/noisier
         self.smoothed_cx = None
         self.smoothed_cy = None
 
@@ -687,16 +689,18 @@ FACE_QUERY_PHRASES = (
 def handle_voice_result(text):
     print(f"[Voice Result] {text}")
     lowered = text.lower()
-
+    #object_detector.suppress()
+    
     if "detect money" in lowered or "identify money" in lowered:
         print("Starting currency detection...")
         pause_object_detection()
+        time.sleep(0.5)
         currency_detector.start(callback=on_currency_detected)
         return
 
     if any(phrase in lowered for phrase in FACE_QUERY_PHRASES):
         print("Starting face recognition (object detection suppressed, not paused)...")
-        object_detector.suppress()
+        #object_detector.suppress()
         face_recognizer.start_recognition_session(timeout_sec=6.0)
         return
 
@@ -705,12 +709,13 @@ def handle_voice_result(text):
             name = text[lowered.index(trigger) + len(trigger):].strip().title()
             if name:
                 speak(f"Okay, look at the camera. Enrolling {name}.")
-                object_detector.suppress()
+                #object_detector.suppress()
                 face_recognizer.start_enrollment(name)
             else:
                 speak("I didn't catch the name. Please try again.")
             return
-
+            
+    object_detector.unsuppress()
     speak("I didn't understand that command.")
 
 def on_mul(state):
@@ -735,10 +740,11 @@ def on_mul(state):
             # Always come out of suppression by default once recognition
             # finishes; handle_voice_result() will re-suppress if the
             # command itself needs the camera (face recognition/enroll).
-            object_detector.unsuppress()
+            #object_detector.unsuppress()
             if text:
                 handle_voice_result(text)
-
+            else:
+                object_detector.unsuppress()
         voice.start_recording(callback=on_voice_recognized)
     else:  # long press – this is the ONLY way recording stops now
         print("Cancelling voice recognition...")

@@ -1,0 +1,17 @@
+services:
+  ei-yolox-detection-runner:
+    image: ${DOCKER_REGISTRY_BASE:-ghcr.io/arduino/}app-bricks/ei-models-runner:0.12.1
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+    ports:
+      - ${BIND_ADDRESS:-0.0.0.0}:4914:4912
+      - ${BIND_ADDRESS:-0.0.0.0}:5051:5050
+    command: ["--model-file", "/models/ootb/ei/yolo-x-nano.eim", "--gst-source", "tcpserversrc host=0.0.0.0 port=5050 ! jpegdec", "--dont-print-predictions", "--preview-original-resolution"]
+    healthcheck:
+      test: [ "CMD-SHELL", "grep -i ':13BA' /proc/net/tcp | grep ' 0A ' || exit 1" ]
+      interval: 2s
+      timeout: 2s
+      retries: 25
