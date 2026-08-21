@@ -16,6 +16,7 @@ from arduino.app_utils import Bridge, App
 from arduino.app_bricks.web_ui import WebUI
 from arduino.app_bricks.video_imageclassification import VideoImageClassification
 from arduino.app_bricks.video_objectdetection import VideoObjectDetection
+from yolox_detector import VideoObjectDetection as YoloxObjectDetection
 from arduino.app_peripherals.camera import Camera
 from face_recognition_manager import FaceRecognitionManager
 from osm_nav import OsmNavigationEngine
@@ -227,6 +228,83 @@ def on_currency_detected(label):
     object_detector.unsuppress()
 
 # ============================================================
+# YOLOX Scanner – "what's around me". Same pre-initialized-once
+# pattern as CurrencyDetector: the stream stays running permanently,
+# a flag gates whether detections get collected. Sweep drives the
+# servo directly (bypassing ObjectDetectionManager, which is
+# suppressed for the duration so it doesn't fight for the servo).
+# ============================================================
+class YoloxScanner:
+    SWEEP_PAN_MIN = 30
+    SWEEP_PAN_MAX = 150
+    SWEEP_TILT = 90
+    SWEEP_STEP_DEG = 5
+    SWEEP_STEP_DELAY = 0.5  # lower = faster sweep
+
+    def __init__(self, camera, confidence=0.4):
+        self.collecting = False
+        self.detected_labels = set()
+        self.labels_lock = threading.Lock()
+
+        self.detector = YoloxObjectDetection(
+            camera=camera,
+            confidence=confidence,
+            debounce_sec=0.0,
+        )
+
+        def _on_all(detections):
+            self._process(detections)
+
+        self.detector.on_detect_all(_on_all)
+        self.detector.start()
+        print("[Yolox] Scanner pre-initialized and pipeline running.")
+
+    def _process(self, detections: dict):
+        if not self.collecting or not detections:
+            return
+        with self.labels_lock:
+            for label in detections.keys():
+                self.detected_labels.add(label)
+
+    def run_sweep(self, on_complete):
+        """Blocking sweep — call this from its own thread."""
+        with self.labels_lock:
+            self.detected_labels = set()
+        self.collecting = True
+
+        for angle in range(self.SWEEP_PAN_MIN, self.SWEEP_PAN_MAX + 1, self.SWEEP_STEP_DEG):
+            Bridge.notify("servo", f"{angle},{self.SWEEP_TILT}")
+            time.sleep(self.SWEEP_STEP_DELAY)
+
+        self.collecting = False
+        Bridge.notify("servo", "90,90")
+
+        with self.labels_lock:
+            labels = sorted(self.detected_labels)
+        on_complete(labels)
+
+yolox_scanner = YoloxScanner(camera=camera_for_bricks, confidence=0.5)
+
+def _describe(labels):
+    if not labels:
+        return "I don't see anything around."
+    if len(labels) == 1:
+        return f"I see a {labels[0]}."
+    return "I see " + ", ".join(labels[:-1]) + f", and {labels[-1]}."
+
+def on_yolox_scan_done(labels):
+    print(f"[Yolox] Sweep complete. Labels: {labels}")
+    speak(_describe(labels))
+    time.sleep(1)
+    object_detector.unsuppress()
+
+SURROUNDINGS_QUERY_PHRASES = (
+    "what's around me",
+    "whats around me",
+    "what is around me",
+)
+
+# ============================================================
 # Face Recognition
 # ============================================================
 face_recognizer = FaceRecognitionManager(camera=camera_for_bricks)
@@ -266,10 +344,10 @@ class ObjectDetectionManager:
         self.FRAME_CENTER_X = self.FRAME_WIDTH // 2
         self.FRAME_CENTER_Y = self.FRAME_HEIGHT // 2
 
-        self.PAN_MIN = 30
-        self.PAN_MAX = 150
-        self.TILT_MIN = 40
-        self.TILT_MAX = 140
+        self.PAN_MIN = 20
+        self.PAN_MAX = 160
+        self.TILT_MIN = 20
+        self.TILT_MAX = 160
 
         self.DEAD_ZONE_X = 40
         self.DEAD_ZONE_Y = 30
@@ -662,6 +740,12 @@ def handle_voice_result(text):
         print("Starting currency detection...")
         object_detector.suppress()
         currency_detector.start_session(callback=on_currency_detected)
+        return
+
+    if any(phrase in lowered for phrase in SURROUNDINGS_QUERY_PHRASES):
+        print("Starting surroundings scan (YOLOX sweep)...")
+        object_detector.suppress()
+        threading.Thread(target=yolox_scanner.run_sweep, args=(on_yolox_scan_done,), daemon=True).start()
         return
 
     if any(phrase in lowered for phrase in FACE_QUERY_PHRASES):
