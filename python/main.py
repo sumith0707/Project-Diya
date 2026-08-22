@@ -717,8 +717,10 @@ def monitor_obstacles(update_interval=0.05):
 def on_sos(state):
     if state == "sos":
         emergency.trigger_emergency(source="button")
+        #ui.send_message("reply","sos")
     elif state == "sos_cancel":
         emergency.cancel_emergency()
+        #ui.send_message("reply","sos_cancel")
 
 FACE_QUERY_PHRASES = (
     "who's approaching",
