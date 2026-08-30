@@ -59,10 +59,39 @@ class OsmNavigationEngine:
         self.turn_threshold = 30
         self.turn_direction = None
 
+        # Turn vibration callbacks
+        self.on_turn_start_cb = None
+        self.on_turn_end_cb = None
+
     def set_imu(self, imu_reader):
         """Set the IMU reader instance."""
         self.imu = imu_reader
         print("[OSM Nav] IMU reader attached.")
+
+    def on_turn_start(self, callback):
+        """Register callback fired when a turn-confirmation wait begins. callback(direction: str)"""
+        self.on_turn_start_cb = callback
+
+    def on_turn_end(self, callback):
+        """Register callback fired when a turn-confirmation wait ends (confirmed, timed out, or rerouted)."""
+        self.on_turn_end_cb = callback
+
+    def _begin_turn_wait(self, direction):
+        self.waiting_for_turn = True
+        self.turn_direction = direction
+        if self.on_turn_start_cb:
+            try:
+                self.on_turn_start_cb(direction)
+            except Exception as e:
+                print(f"[OSM Nav] Turn-start callback error: {e}")
+
+    def _end_turn_wait(self):
+        self.waiting_for_turn = False
+        if self.on_turn_end_cb:
+            try:
+                self.on_turn_end_cb()
+            except Exception as e:
+                print(f"[OSM Nav] Turn-end callback error: {e}")
 
     def _resolve_destination_coords(self):
         """Resolves the hardcoded text string into coordinate pairs using OSM Nominatim."""
@@ -195,7 +224,7 @@ class OsmNavigationEngine:
     def reroute(self):
         """Force a reroute from the current position to the destination."""
         print("[OSM Nav] Rerouting...")
-        self.waiting_for_turn = False
+        self._end_turn_wait()
         with self._lock:
             self.is_navigating = False
             self.route_initialized = False
@@ -274,7 +303,7 @@ class OsmNavigationEngine:
         if self.waiting_for_turn:
             if self.imu is None:
                 print("[OSM Nav] IMU not available – skipping turn confirmation.")
-                self.waiting_for_turn = False
+                self._end_turn_wait()
                 self._advance_to_next_step()
                 time.sleep(1)
                 return
@@ -285,14 +314,13 @@ class OsmNavigationEngine:
             expected_sign = -1 if self.turn_direction == "left" else 1
             if expected_sign * heading_change > self.turn_threshold:
                 print(f"[OSM Nav] Turn confirmed! Heading changed by {heading_change:.1f}°.")
-                self.waiting_for_turn = False
+                self._end_turn_wait()
                 self._advance_to_next_step()
                 time.sleep(1)
                 return
 
             if time.time() - self.turn_start_time > self.turn_timeout:
                 print(f"[OSM Nav] Turn not detected within {self.turn_timeout}s – rerouting.")
-                self.waiting_for_turn = False
                 self.reroute()
                 time.sleep(1)
                 return
@@ -305,10 +333,9 @@ class OsmNavigationEngine:
             if is_turn_step and self.imu is not None:
                 if not self.waiting_for_turn:
                     print(f"[OSM Nav] Preparing for {turn_modifier} turn. Waiting for IMU confirmation...")
-                    self.waiting_for_turn = True
                     self.turn_start_heading = self.imu.get_heading()
                     self.turn_start_time = time.time()
-                    self.turn_direction = turn_modifier
+                    self._begin_turn_wait(turn_modifier)
                     self.announce_current_step()
                     time.sleep(1)
                     return

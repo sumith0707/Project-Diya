@@ -12,10 +12,10 @@ Servo servo_tilt;
 const int PAN_PIN = 11;
 const int TILT_PIN = 10;
 
-const int PAN_MIN = 40;
-const int PAN_MAX = 140;
-const int TILT_MIN = 50;
-const int TILT_MAX = 130;
+const int PAN_MIN = 20;
+const int PAN_MAX = 160;
+const int TILT_MIN = 20;
+const int TILT_MAX = 160;
 
 float current_pan = 90.0;
 float current_tilt = 90.0;
@@ -26,7 +26,7 @@ int last_written_pan = -1;
 int last_written_tilt = -1;
 
 // time-based ease (per-second rate), replaces per-loop-iteration factor
-const float EASE_RATE = 15.0; // deg/sec convergence speed, tune as needed
+const float EASE_RATE = 8.0; // deg/sec convergence speed, tune as needed
 unsigned long lastServoUpdate = 0;
 
 // ---- Idle detach ----
@@ -39,6 +39,17 @@ unsigned long lastServoActivityMs = 0;
 const unsigned long IDLE_DETACH_MS = 5000; // 5s at rest before detaching
 
 void onServoCommand(String data);
+
+// ============================================================
+// VIBRATION MOTOR CONFIGURATION
+// ============================================================
+// Python drives these directly based on obstacle state + nav turn cues;
+// the sketch just relays digital HIGH/LOW to each motor module.
+const int MOTOR_LEFT_PIN   = A0;
+const int MOTOR_CENTER_PIN = A1;
+const int MOTOR_RIGHT_PIN  = A2;
+
+void onVibrateCommand(String data);
 
 // ============================================================
 // I2C CONFIGURATION (hardware Wire2, A4/A5 on Uno Q)
@@ -165,14 +176,23 @@ void setup() {
   servos_attached = true;
   lastServoActivityMs = millis();
 
+  // ---- Vibration motors ----
+  pinMode(MOTOR_LEFT_PIN, OUTPUT);
+  pinMode(MOTOR_CENTER_PIN, OUTPUT);
+  pinMode(MOTOR_RIGHT_PIN, OUTPUT);
+  digitalWrite(MOTOR_LEFT_PIN, LOW);
+  digitalWrite(MOTOR_CENTER_PIN, LOW);
+  digitalWrite(MOTOR_RIGHT_PIN, LOW);
+
   // ---- RPC Callbacks ----
   Bridge.provide("ping", pingHandler);
   Bridge.provide("get_heading", getIMUHeading);
   Bridge.provide("get_accel", getAccelerometer);
   Bridge.provide("servo", onServoCommand);
+  Bridge.provide("vibrate", onVibrateCommand);
   Serial.println("RPC handlers registered.");
 
-  Serial.println("MCU ready: Interrupt ultrasonic + IMU + Servos + Buttons.");
+  Serial.println("MCU ready: Interrupt ultrasonic + IMU + Servos + Buttons + Vibration.");
 }
 
 // ============================================================
@@ -494,6 +514,27 @@ void onServoCommand(String data) {
       Serial.println("Servos re-attached.");
     }
     lastServoActivityMs = millis();
+  }
+}
+
+// ============================================================
+// VIBRATION MOTOR COMMAND CALLBACK
+// ============================================================
+// Expected format: "L,C,R" where each value is 0 or 1.
+// All pattern/timing logic lives on the Python side; this just
+// mirrors the requested motor state to the outputs.
+void onVibrateCommand(String data) {
+  int firstComma = data.indexOf(',');
+  int secondComma = data.indexOf(',', firstComma + 1);
+
+  if (firstComma > 0 && secondComma > firstComma) {
+    int l = data.substring(0, firstComma).toInt();
+    int c = data.substring(firstComma + 1, secondComma).toInt();
+    int r = data.substring(secondComma + 1).toInt();
+
+    digitalWrite(MOTOR_LEFT_PIN, l ? HIGH : LOW);
+    digitalWrite(MOTOR_CENTER_PIN, c ? HIGH : LOW);
+    digitalWrite(MOTOR_RIGHT_PIN, r ? HIGH : LOW);
   }
 }
 

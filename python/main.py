@@ -24,6 +24,7 @@ from emergency_manager import EmergencyManager
 from voice_recognition import VoiceRecognition
 from imu_module import IMUReader
 from tts_manager import TTSManager
+from vibration_manager import VibrationManager
 
 # ============================================================
 # TTS Setup
@@ -710,6 +711,25 @@ def monitor_obstacles(update_interval=0.05):
             time.sleep(update_interval)
     except KeyboardInterrupt:
         print("Obstacle monitor stopped.")
+
+# ============================================================
+# Vibration Manager – obstacle-avoidance pulses + navigation turn cues
+# ============================================================
+def get_obstacle_state():
+    with obstacle_lock:
+        return (
+            bool(obstacle_data["left"]),
+            bool(obstacle_data["center"]),
+            bool(obstacle_data["right"]),
+        )
+
+vibration_manager = VibrationManager(get_obstacle_state=get_obstacle_state)
+vibration_manager.start()
+
+nav_engine.on_turn_start(vibration_manager.on_turn_start)
+nav_engine.on_turn_end(vibration_manager.on_turn_end)
+
+print("[Main] Vibration manager started, linked to obstacle sensors and navigation turns.")
 
 # ============================================================
 # SOS & Multi-Purpose Button Handlers
