@@ -12,10 +12,10 @@ Servo servo_tilt;
 const int PAN_PIN = 11;
 const int TILT_PIN = 10;
 
-const int PAN_MIN = 20;
-const int PAN_MAX = 160;
-const int TILT_MIN = 20;
-const int TILT_MAX = 160;
+const int PAN_MIN = 40;
+const int PAN_MAX = 140;
+const int TILT_MIN = 50;
+const int TILT_MAX = 130;
 
 float current_pan = 90.0;
 float current_tilt = 90.0;
@@ -26,7 +26,7 @@ int last_written_pan = -1;
 int last_written_tilt = -1;
 
 // time-based ease (per-second rate), replaces per-loop-iteration factor
-const float EASE_RATE = 8.0; // deg/sec convergence speed, tune as needed
+const float EASE_RATE = 15.0; // deg/sec convergence speed, tune as needed
 unsigned long lastServoUpdate = 0;
 
 // ---- Idle detach ----
@@ -64,8 +64,8 @@ void onServoCommand(String data);
 // ============================================================
 // ULTRASONIC SENSORS – INTERRUPT DRIVEN, NON-BLOCKING
 // ============================================================
-const int trigPins[3] = {9, 7, 5};
-const int echoPins[3] = {2, 8, 6};
+const int trigPins[3] = {2, 6, 8};
+const int echoPins[3] = {5, 7, 9};
 
 const float ALPHA = 0.6;
 float filtered[3] = {-1.0, -1.0, -1.0};
