@@ -46,8 +46,6 @@ See `docs/schematic.png` for the full wiring diagram (built in Wokwi, using the 
 
 - **`nav_simulator.py`** — a testing/demo utility that feeds simulated GPS coordinates into `OsmNavigationEngine`, so the full navigation flow (route fetch, turn announcements, IMU turn confirmation) can be exercised and filmed without physically walking an outdoor route. See in-file docstring for usage.
 
-- **`terminal_replay.py`** — a small utility for replaying captured terminal output line-by-line with configurable delays, used for recreating console output in demo recordings when live screen capture wasn't available.
-
 - Additional modules referenced but not detailed here: `face_recognition_manager.py`, `emergency_manager.py`, `voice_recognition.py`, `imu_module.py`, `tts_manager.py`, `yolox_detector.py` — see each file's docstring for specifics.
 
 ---
