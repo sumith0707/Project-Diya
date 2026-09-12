@@ -311,6 +311,14 @@ class OsmNavigationEngine:
             current_heading = self.imu.get_heading()
             heading_change = self.imu.get_relative_heading(self.turn_start_heading)
 
+            print(
+                f"[OSM Nav] [DEBUG] direction={self.turn_direction}, "
+                f"start_heading={self.turn_start_heading:.1f}, "
+                f"current_heading={current_heading:.1f}, "
+                f"heading_change={heading_change:.1f}, "
+                f"threshold={self.turn_threshold}"
+            )
+
             expected_sign = -1 if self.turn_direction == "left" else 1
             if expected_sign * heading_change > self.turn_threshold:
                 print(f"[OSM Nav] Turn confirmed! Heading changed by {heading_change:.1f}°.")

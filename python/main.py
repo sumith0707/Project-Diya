@@ -9,7 +9,7 @@ import sounddevice as sd
 from datetime import datetime, UTC
 
 # ========== Configuration ==========
-BOARD_IP = "192.168.0.106"
+BOARD_IP = "192.168.0.50"
 os.environ["ARDUINO_BOARD_IP"] = BOARD_IP
 
 from arduino.app_utils import Bridge, App
@@ -25,6 +25,7 @@ from voice_recognition import VoiceRecognition
 from imu_module import IMUReader
 from tts_manager import TTSManager
 from vibration_manager import VibrationManager
+from nav_simulator import simulate_navigation
 
 # ============================================================
 # TTS Setup
@@ -93,7 +94,16 @@ camera_for_bricks = IndependentCamera(shared_camera)
 # ============================================================
 DESTINATION_NAME = "Mangalore"
 nav_engine = OsmNavigationEngine(destination_name=DESTINATION_NAME)
-
+# ============================================================
+# Navigation Demo Simulation coordinates (for filming/testing indoors)
+# ============================================================
+# Get these from Google Maps: right-click a point -> the lat,lng shown
+# at the top of the context menu. Pick two points a short walk apart
+# with 1-2 turns between them for a clean demo.
+SIM_START_LAT = 13.064427
+SIM_START_LON = 74.850030
+SIM_DEST_LAT = 13.064005
+SIM_DEST_LON = 74.845056
 # ============================================================
 # IMU Setup
 # ============================================================
@@ -632,10 +642,6 @@ object_detector.start()
 def on_raw_text(sid, message):
     print(f"\n[Raw Text] Client {sid} sent: {message}")
     ui.send_message("reply", f"UNO Q received: {message}", sid)
-    if message == "start":
-        print("Nav starting")
-        nav_engine.update_live_gps(lat2, lng2)
-        print("Nav started")
 
 def on_gps(sid, message):
     global lat2, lng2
@@ -705,7 +711,7 @@ def monitor_obstacles(update_interval=0.05):
                 status += "C" if center else "-"
                 status += "R" if right else "-"
                 timestamp = time.strftime("%H:%M:%S")
-                print(f"[{timestamp}] Obstacles: [{status}]")
+                #print(f"[{timestamp}] Obstacles: [{status}]")
                 prev_state = (left, center, right)
 
             time.sleep(update_interval)
@@ -770,13 +776,21 @@ def handle_voice_result(text):
         threading.Thread(target=yolox_scanner.run_sweep, args=(on_yolox_scan_done,), daemon=True).start()
         return
 
+    if lowered == "simulate navigation":
+        print("[Sim] Starting simulated navigation demo...")
+        threading.Thread(
+            target=simulate_navigation,
+            args=(nav_engine, SIM_START_LAT, SIM_START_LON, SIM_DEST_LAT, SIM_DEST_LON),
+            daemon=True,
+        ).start()
+        
     if any(phrase in lowered for phrase in FACE_QUERY_PHRASES):
         print("Starting face recognition...")
         object_detector.suppress()
         face_recognizer.start_recognition_session(timeout_sec=6.0)
         return
 
-    for trigger in ("remember this face as ", "remember this person as ", "remember them as ", "enroll "):
+    for trigger in ("remember this face as ", "remember, this face as ", "remember, this face as a ", "remember face as ", "remember this person as ", "remember them as ", "enroll "):
         if trigger in lowered:
             name = text[lowered.index(trigger) + len(trigger):].strip().title()
             if name:

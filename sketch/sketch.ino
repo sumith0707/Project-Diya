@@ -35,6 +35,7 @@ unsigned long lastServoUpdate = 0;
 // current. They re-attach automatically the instant a new command
 // arrives via onServoCommand().
 bool servos_attached = true;
+bool vib_state = true; 
 unsigned long lastServoActivityMs = 0;
 const unsigned long IDLE_DETACH_MS = 5000; // 5s at rest before detaching
 
@@ -121,6 +122,17 @@ bool imu_initialized = false;
 unsigned long lastMPURead = 0;
 const unsigned long MPU_READ_INTERVAL = 100;
 
+// ---- Continuous yaw integration ----
+// Integrated every MPU_READ_INTERVAL in loop(), NOT only when Python calls
+// get_heading(). Polling sparsely and integrating instantaneous gyro rate
+// at call-time misses fast turns that finish between polls.
+float imu_yaw = 0.0;
+bool imu_yaw_initialized = false;
+unsigned long lastYawUpdateMs = 0;
+
+unsigned long lastYawPrintMs = 0;
+const unsigned long YAW_PRINT_INTERVAL_MS = 250; // debug print rate
+
 // ============================================================
 // FUNCTION PROTOTYPES
 // ============================================================
@@ -150,6 +162,7 @@ void setup() {
   // ---- Buttons ----
   button.attachClick(shortClick);
   button.attachLongPressStop(longClick);
+  button.attachDoubleClick(doubleClick);
   sos_but.attachClick(shortClick_sos);
   sos_but.attachLongPressStop(longClick_sos);
   pinMode(4, INPUT_PULLUP);
@@ -209,6 +222,29 @@ void loop() {
   if (imu_initialized && (currentMillis - lastMPURead >= MPU_READ_INTERVAL)) {
     lastMPURead = currentMillis;
     readMPU6050();
+
+    // Integrate yaw right here, continuously, regardless of how often
+    // Python polls get_heading().
+    unsigned long nowYawMs = millis();
+    if (imu_yaw_initialized) {
+      float yaw_dt = (nowYawMs - lastYawUpdateMs) / 1000.0;
+      imu_yaw += cached_gz * yaw_dt;
+      if (imu_yaw < 0) imu_yaw += 360;
+      if (imu_yaw >= 360) imu_yaw -= 360;
+    } else {
+      imu_yaw_initialized = true;
+    }
+    lastYawUpdateMs = nowYawMs;
+
+    // ---- Debug: print current yaw + raw gyro rate ----
+    if (nowYawMs - lastYawPrintMs >= YAW_PRINT_INTERVAL_MS) {
+      lastYawPrintMs = nowYawMs;
+      Serial.print("[IMU] Yaw: ");
+      Serial.print(imu_yaw, 2);
+      Serial.print(" deg | GyroZ: ");
+      Serial.print(cached_gz, 2);
+      Serial.println(" deg/s");
+    }
   }
 
   // ---- Ultrasonic ----
@@ -474,19 +510,9 @@ String getAccelerometer() {
 
 float getIMUHeading() {
   if (!imu_initialized) return 0.0;
-
-  static float yaw = 0.0;
-  static unsigned long lastTime = micros();
-  unsigned long currentTime = micros();
-  float dt = (currentTime - lastTime) / 1000000.0;
-  lastTime = currentTime;
-
-  float gyroZ = cached_gz;
-  yaw += gyroZ * dt;
-
-  if (yaw < 0) yaw += 360;
-  if (yaw >= 360) yaw -= 360;
-  return yaw;
+  // yaw is integrated continuously in loop() every MPU_READ_INTERVAL,
+  // not just when this RPC is called - see imu_yaw.
+  return imu_yaw;
 }
 
 // ============================================================
@@ -527,7 +553,7 @@ void onVibrateCommand(String data) {
   int firstComma = data.indexOf(',');
   int secondComma = data.indexOf(',', firstComma + 1);
 
-  if (firstComma > 0 && secondComma > firstComma) {
+  if (firstComma > 0 && secondComma > firstComma && vib_state) {
     int l = data.substring(0, firstComma).toInt();
     int c = data.substring(firstComma + 1, secondComma).toInt();
     int r = data.substring(secondComma + 1).toInt();
@@ -557,6 +583,9 @@ void longClick() {
   Bridge.notify("Mul_Pur", "long");
 }
 
+void doubleClick(){
+  vib_state = !vib_state;
+}
 // ============================================================
 // SYSTEM CALLBACKS
 // ============================================================
