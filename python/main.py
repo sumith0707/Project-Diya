@@ -711,7 +711,7 @@ def monitor_obstacles(update_interval=0.05):
                 status += "C" if center else "-"
                 status += "R" if right else "-"
                 timestamp = time.strftime("%H:%M:%S")
-                #print(f"[{timestamp}] Obstacles: [{status}]")
+                print(f"[{timestamp}] Obstacles: [{status}]")
                 prev_state = (left, center, right)
 
             time.sleep(update_interval)
