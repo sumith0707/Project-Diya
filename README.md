@@ -76,6 +76,9 @@ The trained models are hosted through Edge Impulse rather than being directly in
 The datasets were collected from Kaggle, and the models were trained using cloud GPU resources. Edge Impulse was used to prepare, test, and deploy the trained models for use on the Arduino Uno Q.
 
 The Edge Impulse projects contain the model development and deployment details for the AI systems used in Diya.
+
+---
+
 ## Setup
 
 1. Flash `sketch.ino` to the Uno Q's microcontroller side via the Arduino IDE / Arduino CLI.
