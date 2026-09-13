@@ -50,6 +50,32 @@ See `docs/schematic.png` for the full wiring diagram (built in Wokwi, using the 
 
 ---
 
+## AI Models
+
+Diya uses custom-trained AI models for face detection, object detection, and currency recognition. The models were trained using datasets from Kaggle and deployed to the Arduino Uno Q through Edge Impulse.
+
+The trained models are hosted through Edge Impulse rather than being directly included in this repository.
+
+### Face, Stairs and Pothole Detection
+
+- **Purpose:** Detect faces, stairs, and potholes to improve environmental awareness.
+- **Model type:** Custom-trained object detection model.
+- **Classes:** Face, stairs, pothole.
+- **Deployment:** Arduino Uno Q.
+- **Edge Impulse model/project:** [View Face, Stairs and Pothole Detection Model](https://studio.edgeimpulse.com/public/1077241/live)
+
+### Currency Detection
+
+- **Purpose:** Identify the denomination of Indian currency notes.
+- **Model type:** Custom-trained image classification model.
+- **Deployment:** Arduino Uno Q.
+- **Edge Impulse model/project:** [View Currency Detection Model](https://studio.edgeimpulse.com/public/1078491/live)
+
+### Model Training and Deployment
+
+The datasets were collected from Kaggle, and the models were trained using cloud GPU resources. Edge Impulse was used to prepare, test, and deploy the trained models for use on the Arduino Uno Q.
+
+The Edge Impulse projects contain the model development and deployment details for the AI systems used in Diya.
 ## Setup
 
 1. Flash `sketch.ino` to the Uno Q's microcontroller side via the Arduino IDE / Arduino CLI.
